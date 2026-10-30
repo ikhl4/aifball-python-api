@@ -1,3 +1,5 @@
 lanusstats
 fastapi
 uvicorn
+pandas
+numpy
