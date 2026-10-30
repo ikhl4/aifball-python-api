@@ -1,4 +1,3 @@
 lanusstats
 fastapi
 uvicorn
-python_version = 3.11.9
