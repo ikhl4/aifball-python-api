@@ -100,15 +100,20 @@ def get_fotmob_table(league: str, season: str, stat: str = "xg"):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/fotmob/match")
-def get_fotmob_match(match_url: str):
+@app.get("/fotmob/table")
+def get_fotmob_table(league: str = "ksa.1", season: str = "2026", stat: str = "xg"):
     try:
         fotmob = ls.FotMob()
-        df = fotmob.get_match_data(match_url=match_url)
+        # محاولة جلب جدول الترتيب من FotMob
+        # ملاحظة: قد تحتاج لتعديل اسم الدالة get_season_tables حسب توثيق LanusStats
+        df = fotmob.get_season_tables(league=league, season=season, stat=stat)
+        
+        if df is None or df.empty:
+            return {"error": "لم يتم العثور على بيانات لهذا الدوري."}
+            
         return {"data": df_to_json(df)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 # ==========================================
 # 3. FBRef (إحصائيات فرق ولاعبين)
 # ==========================================
