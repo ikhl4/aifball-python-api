@@ -58,6 +58,17 @@ def get_365_heatmap(match_url: str, player_name: str):
         return {"url": heatmap_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- مسار التشكيلة الجديد لجلب أسماء اللاعبين ---
+@app.get("/365scores/lineup")
+def get_365_lineup(match_url: str):
+    try:
+        scores = ls.ThreeSixFiveScores()
+        df = scores.get_players_info(match_url=match_url)
+        return {"data": df_to_json(df)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+# ------------------------------------------------
         
 @app.get("/sofascore/shotmap")
 def get_sofa_shotmap(match_url: str):
