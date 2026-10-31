@@ -14,7 +14,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# دالة محدثة لتنظيف البيانات قبل إرسالها كـ JSON
+# دالة تنظيف البيانات قبل إرسالها كـ JSON
 def df_to_json(df):
     if df is None or df.empty:
         return []
@@ -59,7 +59,6 @@ def get_365_heatmap(match_url: str, player_name: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- مسار التشكيلة الجديد لجلب أسماء اللاعبين ---
 @app.get("/365scores/lineup")
 def get_365_lineup(match_url: str):
     try:
@@ -68,7 +67,6 @@ def get_365_lineup(match_url: str):
         return {"data": df_to_json(df)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-# ------------------------------------------------
         
 @app.get("/sofascore/shotmap")
 def get_sofa_shotmap(match_url: str):
@@ -92,28 +90,44 @@ def get_sofa_heatmap(match_url: str, player_name: str):
 # 2. FotMob (جداول، خرائط تسديد، إحصائيات)
 # ==========================================
 @app.get("/fotmob/table")
-def get_fotmob_table(league: str, season: str, stat: str = "xg"):
-    try:
-        fotmob = ls.FotMob()
-        df = fotmob.get_season_tables(league, season, stat)
-        return {"data": df_to_json(df)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/fotmob/table")
 def get_fotmob_table(league: str = "ksa.1", season: str = "2026", stat: str = "xg"):
     try:
         fotmob = ls.FotMob()
-        # محاولة جلب جدول الترتيب من FotMob
-        # ملاحظة: قد تحتاج لتعديل اسم الدالة get_season_tables حسب توثيق LanusStats
-        df = fotmob.get_season_tables(league=league, season=season, stat=stat)
+        
+        # 🌟 خريطة تحويل أكواد الدوريات إلى أرقام FotMob الحقيقية
+        league_ids = {
+            "ksa.1": 536,         # دوري روشن السعودي
+            "eng.1": 47,          # الدوري الإنجليزي
+            "esp.1": 87,          # الدوري الإسباني
+            "ita.1": 55,          # الدوري الإيطالي
+            "ger.1": 54,          # الدوري الألماني
+            "fra.1": 53,          # الدوري الفرنسي
+            "uefa.champions": 42  # دوري أبطال أوروبا
+        }
+        
+        # إذا لم يجد الكود، الافتراضي هو الدوري السعودي
+        league_id = league_ids.get(league, 536)
+        
+        # جلب البيانات باستخدام الرقم الصحيح
+        df = fotmob.get_season_tables(league_id=league_id, season=season, stat=stat)
         
         if df is None or df.empty:
             return {"error": "لم يتم العثور على بيانات لهذا الدوري."}
             
         return {"data": df_to_json(df)}
     except Exception as e:
+        print(f"Error fetching table: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/fotmob/match")
+def get_fotmob_match(match_url: str):
+    try:
+        fotmob = ls.FotMob()
+        df = fotmob.get_match_data(match_url=match_url)
+        return {"data": df_to_json(df)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ==========================================
 # 3. FBRef (إحصائيات فرق ولاعبين)
 # ==========================================
@@ -127,10 +141,17 @@ def get_fbref_team_stats(stat_type: str, league: str, season: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/fbref/player-stats")
-def get_fbref_player_stats(stat_type: str, league: str, season: str):
+def get_fbref_player_stats(stat_type: str, league: str, season: str, player_name: str = None):
     try:
         fbref = ls.Fbref()
         df = fbref.get_player_season_stats(stat_type, league, season=season)
+        
+        # إذا تم تمرير اسم لاعب، نقوم بفلترة النتيجة
+        if player_name and df is not None and not df.empty:
+            # البحث عن اللاعب (بشكل تقريبي لتفادي مشاكل الهمزات والمسافات)
+            mask = df.apply(lambda row: row.astype(str).str.contains(player_name, case=False).any(), axis=1)
+            df = df[mask]
+            
         return {"data": df_to_json(df)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
