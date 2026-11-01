@@ -2,12 +2,12 @@
 import os
 import re
 import math
+import inspect
 import logging
 import unicodedata
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Optional
-from urllib.parse import urlencode
 
 import requests
 import pandas as pd
@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="AiFBall Football Data API",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -48,10 +48,11 @@ app.add_middleware(
 
 FOTMOB_BASE = "https://www.fotmob.com/api/data"
 
-# لا تفعل الوصول الآلي إلى FotMob
-# إلا بعد التأكد من وجود التصريح المناسب.
+# لا تفعّل الوصول الآلي إلا إذا كان مصرحًا به.
 FOTMOB_ENABLED = (
-    os.getenv("FOTMOB_ENABLED", "false").lower()
+    os.getenv("FOTMOB_ENABLED", "false")
+    .strip()
+    .lower()
     == "true"
 )
 
@@ -60,12 +61,12 @@ HTTP_TIMEOUT = 15
 session = requests.Session()
 session.headers.update({
     "Accept": "application/json",
-    "User-Agent": "AiFBall/2.0"
+    "User-Agent": "AiFBall/2.1"
 })
 
 
 # ==========================================
-# Helpers
+# General helpers
 # ==========================================
 
 def sanitize(value):
@@ -78,20 +79,28 @@ def sanitize(value):
     if isinstance(value, (datetime, pd.Timestamp)):
         return value.isoformat()
 
+    if isinstance(value, np.ndarray):
+        return sanitize(value.tolist())
+
     if isinstance(value, float):
         return value if math.isfinite(value) else None
 
     if isinstance(value, dict):
         return {
-            str(k): sanitize(v)
-            for k, v in value.items()
+            str(key): sanitize(item)
+            for key, item in value.items()
         }
 
     if isinstance(value, (list, tuple)):
-        return [sanitize(v) for v in value]
+        return [sanitize(item) for item in value]
 
-    if pd.isna(value) is True:
-        return None
+    try:
+        missing = pd.isna(value)
+
+        if isinstance(missing, (bool, np.bool_)) and missing:
+            return None
+    except (TypeError, ValueError):
+        pass
 
     return value
 
@@ -100,10 +109,10 @@ def df_to_json(df):
     if df is None:
         return []
 
-    if not isinstance(df, pd.DataFrame):
-        if isinstance(df, list):
-            return sanitize(df)
+    if isinstance(df, list):
+        return sanitize(df)
 
+    if not isinstance(df, pd.DataFrame):
         raise HTTPException(
             status_code=502,
             detail="صيغة بيانات المصدر غير مدعومة"
@@ -135,14 +144,143 @@ def source_error(source, error):
     )
 
 
+def as_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+
+    try:
+        result = float(value)
+
+        if not math.isfinite(result):
+            return None
+
+        return (
+            int(result)
+            if result.is_integer()
+            else result
+        )
+
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def first_number(item, *keys):
+    if not isinstance(item, dict):
+        return None
+
+    for key in keys:
+        result = as_number(item.get(key))
+
+        if result is not None:
+            return result
+
+    return None
+
+
+def normalize_text(value):
+    text = unicodedata.normalize(
+        "NFKD",
+        str(value or "")
+    )
+
+    text = "".join(
+        character
+        for character in text
+        if not unicodedata.combining(character)
+    )
+
+    text = (
+        text.replace("أ", "ا")
+        .replace("إ", "ا")
+        .replace("آ", "ا")
+        .replace("ى", "ي")
+    )
+
+    text = re.sub(
+        r"[^\w\s]",
+        " ",
+        text.casefold()
+    )
+
+    return " ".join(text.split())
+
+
+# ==========================================
+# Season handling
+# ==========================================
+
+def normalize_season(season):
+    if season is None or not str(season).strip():
+        return None
+
+    value = str(season).strip()
+
+    if re.fullmatch(r"\d{4}", value):
+        year = int(value)
+
+        if 1990 <= year <= 2100:
+            return value
+
+    match = re.fullmatch(
+        r"(\d{4})[-/](\d{4})",
+        value
+    )
+
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2))
+
+        if (
+            1990 <= start <= 2100
+            and end == start + 1
+        ):
+            return f"{start}/{end}"
+
+    raise HTTPException(
+        status_code=400,
+        detail="صيغة الموسم غير صحيحة"
+    )
+
+
+def season_start(season):
+    if season is None:
+        return None
+
+    match = re.match(
+        r"^(\d{4})",
+        str(season).strip()
+    )
+
+    return int(match.group(1)) if match else None
+
+
+def seasons_match(requested, returned):
+    requested_value = normalize_season(requested)
+    returned_value = normalize_season(returned)
+
+    if not requested_value or not returned_value:
+        return False
+
+    # 2026 و2026/2027 لهما سنة بداية واحدة.
+    # نستخدمها للتوافق مع واجهة Next.js.
+    return (
+        season_start(requested_value)
+        == season_start(returned_value)
+    )
+
+
+# ==========================================
+# FotMob access
+# ==========================================
+
 def require_fotmob():
     if not FOTMOB_ENABLED:
         raise HTTPException(
             status_code=503,
             detail=(
                 "مصدر FotMob غير مفعل. "
-                "يلزم التصريح المناسب ثم ضبط "
-                "FOTMOB_ENABLED=true"
+                "يلزم التأكد من التصريح المناسب "
+                "ثم ضبط FOTMOB_ENABLED=true"
             )
         )
 
@@ -161,14 +299,14 @@ def fotmob_request(path, params=None):
 
         response.raise_for_status()
 
-        data = response.json()
+        payload = response.json()
 
-        if not isinstance(data, (dict, list)):
+        if not isinstance(payload, (dict, list)):
             raise ValueError(
-                "Unexpected JSON structure"
+                "Unexpected FotMob response"
             )
 
-        return data
+        return payload
 
     except requests.Timeout:
         raise HTTPException(
@@ -194,88 +332,32 @@ def fotmob_request(path, params=None):
         )
 
 
-def as_number(value):
-    if value is None or isinstance(value, bool):
-        return None
-
-    try:
-        result = float(value)
-
-        if not math.isfinite(result):
-            return None
-
-        return int(result) if result.is_integer() else result
-
-    except (ValueError, TypeError):
-        return None
-
-
-def first_number(item, *keys):
-    for key in keys:
-        value = as_number(item.get(key))
-
-        if value is not None:
-            return value
-
-    return None
-
-
-def normalize_text(value):
-    text = unicodedata.normalize(
-        "NFKD",
-        str(value or "")
-    )
-
-    text = "".join(
-        char for char in text
-        if not unicodedata.combining(char)
-    )
-
-    text = re.sub(
-        r"[\u064b-\u065f]",
-        "",
-        text
-    )
-
-    text = (
-        text.replace("أ", "ا")
-        .replace("إ", "ا")
-        .replace("آ", "ا")
-        .replace("ى", "ي")
-    )
-
-    return " ".join(text.casefold().split())
-
-
 # ==========================================
 # League aliases
-# These are search aliases, not guaranteed IDs.
 # ==========================================
 
 LEAGUE_ALIASES = {
     "ksa.1": [
         "دوري روشن",
         "الدوري السعودي",
-        "saudi pro league"
+        "saudi pro league",
+        "saudi professional league"
     ],
     "egy.1": [
         "الدوري المصري",
-        "الدوري المصري الممتاز",
         "egyptian premier league"
     ],
     "uae.1": [
         "الدوري الاماراتي",
-        "دوري ادنوك",
-        "uae pro league"
+        "uae pro league",
+        "adnoc pro league"
     ],
     "qat.1": [
         "الدوري القطري",
-        "دوري نجوم قطر",
         "qatar stars league"
     ],
     "kuw.1": [
         "الدوري الكويتي",
-        "دوري زين الكويتي",
         "kuwait premier league"
     ],
     "bhr.1": [
@@ -296,7 +378,8 @@ LEAGUE_ALIASES = {
     ],
     "esp.1": [
         "الدوري الاسباني",
-        "la liga"
+        "la liga",
+        "laliga"
     ],
     "ita.1": [
         "الدوري الايطالي",
@@ -310,10 +393,20 @@ LEAGUE_ALIASES = {
         "الدوري الفرنسي",
         "ligue 1"
     ],
+    "usa.1": [
+        "الدوري الامريكي",
+        "major league soccer",
+        "mls"
+    ],
+    "uefa.champions": [
+        "دوري ابطال اوروبا",
+        "champions league",
+        "uefa champions league"
+    ]
 }
 
-# معرفات موثقة في المشروع أو المصادر.
-# لا نضيف معرفًا غير متحقق منه.
+# معرفات موجودة في إعدادات المشروع.
+# يجب التحقق من صلاحيتها لدى المصدر قبل الإنتاج.
 KNOWN_FOTMOB_IDS = {
     "ksa.1": 536,
     "eng.1": 47,
@@ -326,13 +419,13 @@ KNOWN_FOTMOB_IDS = {
 
 
 def resolve_league_id(league):
-    value = str(league).strip()
+    value = str(league).strip().lower()
 
     if value.isdigit():
-        result = int(value)
+        league_id = int(value)
 
-        if result > 0:
-            return result
+        if 0 < league_id <= 10000000:
+            return league_id
 
     if value in KNOWN_FOTMOB_IDS:
         return KNOWN_FOTMOB_IDS[value]
@@ -341,30 +434,8 @@ def resolve_league_id(league):
         status_code=404,
         detail=(
             "معرف البطولة غير معروف. "
-            "استخدم /leagues/search لاكتشاف "
-            "معرف FotMob الصحيح."
+            "استخدم /leagues/search لاكتشافه."
         )
-    )
-
-
-def normalize_season(season):
-    if not season:
-        return None
-
-    value = season.strip()
-
-    if re.fullmatch(r"\d{4}/\d{4}", value):
-        return value
-
-    if re.fullmatch(r"\d{4}-\d{4}", value):
-        return value.replace("-", "/")
-
-    if re.fullmatch(r"\d{4}", value):
-        return value
-
-    raise HTTPException(
-        status_code=400,
-        detail="صيغة الموسم غير صحيحة"
     )
 
 
@@ -387,13 +458,15 @@ def get_league_directory():
             return
 
         league_id = as_number(item.get("id"))
-
         name = item.get("name")
 
-        if league_id is None or not name:
+        if (
+            league_id is None
+            or not isinstance(league_id, int)
+            or league_id <= 0
+            or not name
+        ):
             return
-
-        league_id = int(league_id)
 
         if league_id in seen:
             return
@@ -421,8 +494,8 @@ def get_league_directory():
             continue
 
         country_name = (
-            country.get("name") or
-            country.get("ccode")
+            country.get("name")
+            or country.get("ccode")
         )
 
         for item in country.get("leagues", []):
@@ -439,31 +512,23 @@ def search_leagues(
     require_fotmob()
 
     query = normalize_text(q)
-
-    aliases = []
+    terms = {query}
 
     for code, names in LEAGUE_ALIASES.items():
-        if query == normalize_text(code):
-            aliases.extend(names)
+        all_names = [code] + names
 
-        for name in names:
-            normalized = normalize_text(name)
-
-            if query == normalized:
-                aliases.extend(names)
-                aliases.append(code)
-                break
-
-    terms = [query] + [
-        normalize_text(value)
-        for value in aliases
-    ]
-
-    directory = get_league_directory()
+        if query in {
+            normalize_text(name)
+            for name in all_names
+        }:
+            terms.update(
+                normalize_text(name)
+                for name in all_names
+            )
 
     matches = []
 
-    for league in directory:
+    for league in get_league_directory():
         searchable = normalize_text(
             " ".join([
                 str(league.get("name") or ""),
@@ -502,7 +567,7 @@ def list_leagues(
 
 
 # ==========================================
-# FotMob standings
+# FotMob standings normalization
 # ==========================================
 
 def normalize_standing_row(raw):
@@ -511,13 +576,12 @@ def normalize_standing_row(raw):
 
     name = raw.get("name")
 
-    if not name:
+    if not isinstance(name, str) or not name.strip():
         return None
 
+    scores = raw.get("scoresStr")
     gf = None
     ga = None
-
-    scores = raw.get("scoresStr")
 
     if isinstance(scores, str):
         match = re.fullmatch(
@@ -529,17 +593,19 @@ def normalize_standing_row(raw):
             gf = int(match.group(1))
             ga = int(match.group(2))
 
-    gf = first_number(
-        raw,
-        "goalsFor",
-        "gf"
-    ) if gf is None else gf
+    if gf is None:
+        gf = first_number(
+            raw,
+            "goalsFor",
+            "gf"
+        )
 
-    ga = first_number(
-        raw,
-        "goalsAgainst",
-        "ga"
-    ) if ga is None else ga
+    if ga is None:
+        ga = first_number(
+            raw,
+            "goalsAgainst",
+            "ga"
+        )
 
     gd = first_number(
         raw,
@@ -548,20 +614,26 @@ def normalize_standing_row(raw):
         "gd"
     )
 
-    if gd is None and gf is not None and ga is not None:
+    if (
+        gd is None
+        and gf is not None
+        and ga is not None
+    ):
         gd = gf - ga
 
     team_id = raw.get("id")
 
     logo = None
 
-    if team_id is not None:
-        if str(team_id).isdigit():
-            logo = (
-                "https://images.fotmob.com/"
-                "image_resources/logo/teamlogo/"
-                f"{team_id}.png"
-            )
+    if (
+        team_id is not None
+        and str(team_id).isdigit()
+    ):
+        logo = (
+            "https://images.fotmob.com/"
+            "image_resources/logo/teamlogo/"
+            f"{team_id}.png"
+        )
 
     return {
         "id": str(team_id or name),
@@ -569,23 +641,68 @@ def normalize_standing_row(raw):
             raw,
             "idx",
             "rank",
-            "position"
+            "position",
+            "pos"
         ),
-        "name": str(name),
+        "name": name.strip(),
         "logo": logo,
-        "played": first_number(raw, "played"),
-        "won": first_number(raw, "wins"),
-        "draw": first_number(raw, "draws"),
-        "lost": first_number(raw, "losses"),
+        "played": first_number(
+            raw,
+            "played"
+        ),
+        "won": first_number(
+            raw,
+            "wins",
+            "won"
+        ),
+        "draw": first_number(
+            raw,
+            "draws",
+            "draw"
+        ),
+        "lost": first_number(
+            raw,
+            "losses",
+            "lost"
+        ),
         "gf": gf,
         "ga": ga,
         "gd": gd,
-        "pts": first_number(raw, "pts", "points")
+        "pts": first_number(
+            raw,
+            "pts",
+            "points"
+        )
     }
+
+
+def normalize_rows(raw_rows):
+    rows = []
+
+    if not isinstance(raw_rows, list):
+        return rows
+
+    for raw in raw_rows:
+        row = normalize_standing_row(raw)
+
+        if row is not None:
+            rows.append(row)
+
+    rows.sort(
+        key=lambda row: (
+            row["pos"] is None,
+            row["pos"] if row["pos"] is not None else 0
+        )
+    )
+
+    return rows
 
 
 def extract_fotmob_groups(payload):
     raw_tables = payload.get("table")
+
+    if isinstance(raw_tables, dict):
+        raw_tables = [raw_tables]
 
     if not isinstance(raw_tables, list):
         return []
@@ -601,15 +718,15 @@ def extract_fotmob_groups(payload):
         if not isinstance(data, dict):
             continue
 
-        table = data.get("table")
+        candidates = []
 
-        candidate_groups = []
+        table = data.get("table")
 
         if isinstance(table, dict):
             rows = table.get("all")
 
             if isinstance(rows, list):
-                candidate_groups.append({
+                candidates.append({
                     "name": (
                         data.get("leagueName")
                         or "الترتيب العام"
@@ -617,8 +734,6 @@ def extract_fotmob_groups(payload):
                     "rows": rows
                 })
 
-        # بعض البطولات تعيد tables
-        # بدل table، ومنها مجموعات متعددة.
         split_tables = data.get("tables")
 
         if isinstance(split_tables, list):
@@ -626,17 +741,18 @@ def extract_fotmob_groups(payload):
                 if not isinstance(item, dict):
                     continue
 
-                nested = item.get("table", {})
+                nested = item.get("table")
 
-                if isinstance(nested, dict):
-                    rows = nested.get("all")
-                else:
-                    rows = None
+                rows = (
+                    nested.get("all")
+                    if isinstance(nested, dict)
+                    else None
+                )
 
                 if not isinstance(rows, list):
                     continue
 
-                candidate_groups.append({
+                candidates.append({
                     "name": (
                         item.get("name")
                         or item.get("leagueName")
@@ -645,37 +761,41 @@ def extract_fotmob_groups(payload):
                     "rows": rows
                 })
 
-        for candidate in candidate_groups:
-            rows = [
-                normalized
-                for raw in candidate["rows"]
-                if (
-                    normalized := normalize_standing_row(raw)
-                ) is not None
-            ]
+        for candidate in candidates:
+            rows = normalize_rows(
+                candidate["rows"]
+            )
 
             if not rows:
                 continue
 
             groups.append({
-                "id": f"group-{index + 1}-{len(groups) + 1}",
-                "name": candidate["name"],
+                "id": f"group-{len(groups) + 1}",
+                "name": str(candidate["name"]),
                 "rows": rows
             })
 
     return groups
 
 
+# ==========================================
+# FotMob standings endpoint
+# ==========================================
+
 @app.get("/fotmob/standings")
 def get_fotmob_standings(
     league: str = Query("ksa.1", max_length=100),
     season: Optional[str] = None
 ):
+    require_fotmob()
+
     league_id = resolve_league_id(league)
 
-    params = {"id": league_id}
+    requested_season = normalize_season(
+        season
+    )
 
-    requested_season = normalize_season(season)
+    params = {"id": league_id}
 
     if requested_season:
         params["season"] = requested_season
@@ -691,16 +811,36 @@ def get_fotmob_standings(
             detail="استجابة البطولة غير صالحة"
         )
 
-    details = payload.get("details", {})
+    details = payload.get("details")
 
     if not isinstance(details, dict):
         details = {}
 
-    returned_season = details.get("selectedSeason")
+    returned_season = details.get(
+        "selectedSeason"
+    )
 
-    # لا نعرض موسمًا مختلفًا عن المطلوب.
-    if requested_season and returned_season:
-        if requested_season != str(returned_season):
+    # عند تحديد الموسم لا نقبل بيانات
+    # لم يؤكد المصدر موسمها.
+    if requested_season:
+        if not returned_season:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "تعذر تأكيد موسم بيانات "
+                    "الترتيب من المصدر"
+                )
+            )
+
+        try:
+            matching = seasons_match(
+                requested_season,
+                str(returned_season)
+            )
+        except HTTPException:
+            matching = False
+
+        if not matching:
             raise HTTPException(
                 status_code=404,
                 detail=(
@@ -709,7 +849,9 @@ def get_fotmob_standings(
                 )
             )
 
-    groups = extract_fotmob_groups(payload)
+    groups = extract_fotmob_groups(
+        payload
+    )
 
     if not groups:
         raise HTTPException(
@@ -744,7 +886,7 @@ def get_fotmob_standings(
 def read_root():
     return {
         "status": "AiFBall Python API is running",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "fotmobEnabled": FOTMOB_ENABLED
     }
 
@@ -757,11 +899,14 @@ def read_root():
 def get_365_shotmap(match_url: str):
     try:
         scores = ls.ThreeSixFiveScores()
+
         df = scores.get_match_shotmap(
             match_url=match_url
         )
 
-        return {"data": df_to_json(df)}
+        return {
+            "data": df_to_json(df)
+        }
 
     except HTTPException:
         raise
@@ -777,12 +922,16 @@ def get_365_heatmap(
     try:
         scores = ls.ThreeSixFiveScores()
 
-        heatmap_url = scores.get_player_heatmap_match(
-            player=player_name,
-            match_url=match_url
+        heatmap_url = (
+            scores.get_player_heatmap_match(
+                player=player_name,
+                match_url=match_url
+            )
         )
 
-        return {"url": heatmap_url}
+        return {
+            "url": heatmap_url
+        }
 
     except HTTPException:
         raise
@@ -799,7 +948,9 @@ def get_365_lineup(match_url: str):
             match_url=match_url
         )
 
-        return {"data": df_to_json(df)}
+        return {
+            "data": df_to_json(df)
+        }
 
     except HTTPException:
         raise
@@ -820,7 +971,9 @@ def get_sofa_shotmap(match_url: str):
             match_url=match_url
         )
 
-        return {"data": df_to_json(df)}
+        return {
+            "data": df_to_json(df)
+        }
 
     except HTTPException:
         raise
@@ -836,12 +989,16 @@ def get_sofa_heatmap(
     try:
         sofa = ls.SofaScore()
 
-        heatmap_url = sofa.get_player_heatmap_match(
-            player=player_name,
-            match_url=match_url
+        heatmap_url = (
+            sofa.get_player_heatmap_match(
+                player=player_name,
+                match_url=match_url
+            )
         )
 
-        return {"url": heatmap_url}
+        return {
+            "url": heatmap_url
+        }
 
     except HTTPException:
         raise
@@ -861,7 +1018,9 @@ def get_fotmob_table(
 ):
     require_fotmob()
 
-    league_id = resolve_league_id(league)
+    league_id = resolve_league_id(
+        league
+    )
 
     allowed_stats = {
         "all",
@@ -877,8 +1036,6 @@ def get_fotmob_table(
             detail="نوع الجدول غير مدعوم"
         )
 
-    # جداول FotMob العادية تمر عبر
-    # /fotmob/standings، وليس إحصائيات xG.
     if stat == "all":
         return get_fotmob_standings(
             league=league,
@@ -888,30 +1045,47 @@ def get_fotmob_table(
     try:
         fotmob = ls.FotMob()
 
-        # ملاحظة: توقيع get_season_tables
-        # يختلف بين إصدارات LanusStats.
-        # نتحقق من التوافق بدل اختلاق نتيجة.
-        import inspect
-
-        signature = inspect.signature(
-            fotmob.get_season_tables
+        method = getattr(
+            fotmob,
+            "get_season_tables",
+            None
         )
 
-        if "league_id" in signature.parameters:
-            df = fotmob.get_season_tables(
-                league_id=league_id,
-                season=season,
-                stat=stat
-            )
-        else:
+        if method is None:
             raise HTTPException(
                 status_code=501,
                 detail=(
-                    "إصدار LanusStats الحالي يحتاج "
-                    "إلى محول متوافق لجداول "
-                    "FotMob المتقدمة"
+                    "إصدار LanusStats الحالي "
+                    "لا يدعم جداول الموسم المتقدمة"
                 )
             )
+
+        signature = inspect.signature(
+            method
+        )
+
+        required = {
+            "league_id",
+            "season",
+            "stat"
+        }
+
+        if not required.issubset(
+            signature.parameters
+        ):
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "توقيع LanusStats الحالي "
+                    "غير متوافق مع هذه الخدمة"
+                )
+            )
+
+        df = method(
+            league_id=league_id,
+            season=season,
+            stat=stat
+        )
 
         rows = df_to_json(df)
 
@@ -946,7 +1120,9 @@ def get_fotmob_match(match_url: str):
             match_url=match_url
         )
 
-        return {"data": df_to_json(df)}
+        return {
+            "data": df_to_json(df)
+        }
 
     except HTTPException:
         raise
@@ -973,7 +1149,9 @@ def get_fbref_team_stats(
             season=season
         )
 
-        return {"data": df_to_json(df)}
+        return {
+            "data": df_to_json(df)
+        }
 
     except HTTPException:
         raise
@@ -999,7 +1177,7 @@ def get_fbref_player_stats(
 
         if (
             player_name
-            and df is not None
+            and isinstance(df, pd.DataFrame)
             and not df.empty
         ):
             mask = df.apply(
@@ -1015,7 +1193,9 @@ def get_fbref_player_stats(
 
             df = df[mask]
 
-        return {"data": df_to_json(df)}
+        return {
+            "data": df_to_json(df)
+        }
 
     except HTTPException:
         raise
@@ -1036,7 +1216,9 @@ def get_tm_player_value(player_name: str):
             player_name
         )
 
-        return {"data": df_to_json(df)}
+        return {
+            "data": df_to_json(df)
+        }
 
     except HTTPException:
         raise
@@ -1057,7 +1239,9 @@ def get_tm_team_transfers(
             season
         )
 
-        return {"data": df_to_json(df)}
+        return {
+            "data": df_to_json(df)
+        }
 
     except HTTPException:
         raise
