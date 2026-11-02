@@ -59,7 +59,7 @@ def value(v):
         return None
     if isinstance(v, (int, float)):
         return str(v) if math.isfinite(v) else None
-    return v.strip() if isinstance(v, str) and v.strip() not in ('', '-', '—') else None
+    return v.strip() if isinstance(v, str) and v.strip() not in ('', '-', '—') and re.fullmatch(r"[0-9\s.%/()+,'−\-:]+", v.strip()) else None
 
 
 def numeric(v):
@@ -169,6 +169,7 @@ class ScoresClient:
                     raise fail('INVALID_UPSTREAM_DATA', 'صيغة بيانات المصدر غير صالحة.')
                 return data
         except HTTPError as error:
+            error.close()
             if error.code in (401, 403, 429):
                 raise fail('UPSTREAM_REJECTED', 'المصدر رفض اتصال خدمة البيانات.') from None
             if error.code == 404:
@@ -208,6 +209,7 @@ class ScoresClient:
                     raise fail('HEATMAP_TOO_LARGE', 'حجم الصورة المحولة غير مدعوم.')
                 return png
         except HTTPError as error:
+            error.close()
             if error.code in (401, 403, 429):
                 raise fail('UPSTREAM_REJECTED', 'المصدر رفض جلب صورة الخريطة.') from None
             raise fail('HEATMAP_UNAVAILABLE', 'صورة الخريطة غير متاحة من المصدر.', 404) from None
