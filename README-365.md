@@ -1,0 +1,13 @@
+# 365Scores match reports and heatmap images
+
+`GET /365scores/match-analysis?match_url=...` returns a provider-scoped report. The source URL must be HTTPS on 365scores.com/www.365scores.com, end with the two team IDs and competition ID, and contain `#id=<365 event ID>`. Generic matchup links are rejected before network access. Event, sport, team IDs, competition and optional statistics identity must match. There is no event-ID conversion, latest-fixture guessing or fallback to another match.
+
+The adapter reads the source event and its statistics with ordinary HTTPS requests, explicit timeouts and no redirects/retries. Source values remain strings (including compound passing figures); missing/dash/invalid numbers never become zero. Players come from the source lineup's starters/substitutes joined to its member records, excluding missing players and management. Bench inclusion does not prove minutes played. Optional statistics failure remains explicit.
+
+Shots use 365's `side` (length) and `line` (width) percentages, both teams shown attacking right, matching the coordinate convention in LanusStats visualizations. Outcome y/z are goal-target coordinates and are never substituted for field positions. Source xG/xGOT are preserved or missing; no xG sums/estimates fill gaps.
+
+`GET /365scores/player-heatmap?match_url=...&player_id=...` rechecks the event and unique roster membership, downloads the source-provided image from the exact imagecache.365scores.com host, and decodes it to bounded PNG bytes. Redirects are disabled; response sizes and image dimensions are bounded. It returns image/png with source, event and player headers. It does not fabricate point coordinates from an image. The legacy `/365scores/heatmap` now returns the same PNG format using an exact unique name (both teams), replacing its broken JSON containing a PIL image. Consumers must use an image response, not `{url: ...}`.
+
+Pillow is now an explicit dependency; no LanusStats version/client impersonation changes are made. SofaScore diagnostics remain separate.
+
+Validation: 22 backend tests including the existing 11, identity rejection, preserving zero/missing/compound values, excluding management, both-team image binding, WebP-to-PNG conversion, redirect/host checks and session cleanup; Python compilation. Live code test on the historical Lanus–Union Santa Fe event 4033824 (2024-03-28) returned 22 comparison indicators, 31 shots, 11 starters per team and a source PNG for Julio Soler (player 65524246), 320787 bytes. This confirms one fixture only, not all competitions or seasons. Render must deploy this commit before the frontend can use the new routes.
