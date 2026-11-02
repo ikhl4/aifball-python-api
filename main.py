@@ -990,14 +990,16 @@ def get_sofa_heatmap(
         sofa = ls.SofaScore()
 
         heatmap_url = (
-            sofa.get_player_heatmap_match(
+            sofa.get_player_heatmap(
                 player=player_name,
                 match_url=match_url
             )
         )
 
         return {
-            "url": heatmap_url
+            "source": "SofaScore",
+            "coordinates": "percent-100",
+            "points": df_to_json(heatmap_url)
         }
 
     except HTTPException:
@@ -1247,3 +1249,8 @@ def get_tm_team_transfers(
         raise
     except Exception as error:
         source_error("Transfermarkt", error)
+
+
+
+from analysis_routes import register_analysis_routes
+register_analysis_routes(app, ls, sanitize)
