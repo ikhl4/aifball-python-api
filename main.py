@@ -919,24 +919,7 @@ def get_365_heatmap(
     match_url: str,
     player_name: str
 ):
-    try:
-        scores = ls.ThreeSixFiveScores()
-
-        heatmap_url = (
-            scores.get_player_heatmap_match(
-                player=player_name,
-                match_url=match_url
-            )
-        )
-
-        return {
-            "url": heatmap_url
-        }
-
-    except HTTPException:
-        raise
-    except Exception as error:
-        source_error("365Scores", error)
+    return player_heatmap_response(match_url, player_name=player_name)
 
 
 @app.get("/365scores/lineup")
@@ -1254,3 +1237,6 @@ def get_tm_team_transfers(
 
 from analysis_routes import register_analysis_routes
 register_analysis_routes(app, ls, sanitize)
+
+from scores365_routes import register_365_routes, player_heatmap_response
+register_365_routes(app)
