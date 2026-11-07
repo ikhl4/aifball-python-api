@@ -5,3 +5,4 @@ pandas
 numpy
 requests
 Pillow
+psycopg[binary]>=3.2,<4
