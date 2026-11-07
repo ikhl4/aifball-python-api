@@ -16,6 +16,7 @@ import LanusStats as ls
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from chat_jobs import router as chat_jobs_router, start_worker, stop_worker
 
 
 # ==========================================
@@ -26,6 +27,16 @@ app = FastAPI(
     title="AiFBall Football Data API",
     version="2.1.0"
 )
+
+app.include_router(chat_jobs_router)
+
+@app.on_event("startup")
+def initialize_chat_jobs():
+    start_worker()
+
+@app.on_event("shutdown")
+def shutdown_chat_jobs():
+    stop_worker()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aifball")
