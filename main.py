@@ -1105,6 +1105,64 @@ def get_fotmob_table(
         source_error("FotMob", error)
 
 
+
+@app.get("/fotmob/player-season")
+def get_fotmob_player_season(
+    player_id: int = Query(..., ge=1, le=999999999),
+    season: str = Query(..., min_length=4, max_length=9),
+):
+    """Licensed/authorized FotMob adapter. Requires a known player ID."""
+    require_fotmob()
+    normalized = normalize_season(season)
+    payload = fotmob_request("playerData", {"id": player_id})
+    stats = payload.get("stats") if isinstance(payload, dict) else None
+    if not isinstance(stats, dict):
+        return {"found": False, "provider": "fotmob", "reason": "NO_STATS"}
+
+    # FotMob's per-season payload can differ by version. Only accept explicit
+    # season + competition records; never assume a league row is overall.
+    season_rows = stats.get("seasonStats") or stats.get("seasons")
+    if not isinstance(season_rows, list):
+        return {"found": False, "provider": "fotmob", "reason": "UNSUPPORTED_SCHEMA"}
+
+    matches = []
+    for entry in season_rows:
+        if not isinstance(entry, dict):
+            continue
+        entry_season = str(entry.get("season") or "")
+        try:
+            same_season = seasons_match(normalized, entry_season)
+        except HTTPException:
+            same_season = False
+        if not same_season:
+            continue
+        scope = str(entry.get("scope") or entry.get("competition") or "")
+        values = entry.get("stats") if isinstance(entry.get("stats"), dict) else entry
+        extracted = {
+            "matches": first_number(values, "matches", "appearances", "gamesPlayed"),
+            "goals": first_number(values, "goals"),
+            "assists": first_number(values, "assists"),
+        }
+        if not any(value is not None for value in extracted.values()):
+            continue
+        matches.append({"scope": scope, "stats": extracted})
+    if len(matches) != 1:
+        return {"found": False, "provider": "fotmob", "reason": "AMBIGUOUS_OR_MISSING_SEASON"}
+    row = matches[0]
+    is_overall = row["scope"].strip().casefold() in (
+        "all competitions", "overall", "all comps", "جميع المسابقات"
+    )
+    return {
+        "found": True,
+        "provider": "fotmob",
+        "playerId": player_id,
+        "season": season,
+        "scope": "all_competitions" if is_overall else "competition",
+        "competition": row["scope"],
+        "stats": row["stats"],
+    }
+
+
 @app.get("/fotmob/match")
 def get_fotmob_match(match_url: str):
     require_fotmob()
