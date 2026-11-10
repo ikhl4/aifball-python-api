@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from chat_jobs import router as chat_jobs_router, start_worker, stop_worker
 from club_research import router as club_research_router
+from research_sources import router as research_sources_router
 
 
 # ==========================================
@@ -31,6 +32,7 @@ app = FastAPI(
 
 app.include_router(chat_jobs_router)
 app.include_router(club_research_router)
+app.include_router(research_sources_router)
 
 @app.on_event("startup")
 def initialize_chat_jobs():
