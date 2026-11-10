@@ -7,8 +7,8 @@ from datetime import datetime
 
 MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 MONTH = {m: i + 1 for i, m in enumerate(MONTHS)}
-DATE = re.compile(r"\\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\\s+(\\d{1,2})\\s+(" + "|".join(MONTHS) + r")\\b")
-SCORE = re.compile(r"(?<!\\d)(\\d{1,2})\\s*[-–]\\s*(\\d{1,2})(?!\\d)")
+DATE = re.compile(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(" + "|".join(MONTHS) + r")\b")
+SCORE = re.compile(r"(?<!\d)(\d{1,2})\s*[-–]\s*(\d{1,2})(?!\d)")
 COMPETITIONS = (
     ("UEFA Champions League", "UEFA Champions League"),
     ("La Liga", "La Liga"),
@@ -21,7 +21,7 @@ def extract_barcelona_results(text, source_url, squad="first_team"):
         return []
     if not text or "First Team Results" not in text:
         return []
-    year_match = re.search(r"\\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+(20\\d{2})\\b", text[:120])
+    year_match = re.search(r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})\b", text[:120])
     if not year_match:
         return []
     year = int(year_match.group(1))
