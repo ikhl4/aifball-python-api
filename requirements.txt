@@ -6,3 +6,4 @@ numpy
 requests
 Pillow
 psycopg[binary]>=3.2,<4
+beautifulsoup4>=4.12,<5
