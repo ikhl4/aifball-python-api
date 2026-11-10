@@ -84,7 +84,7 @@ def fetch_official(url: str):
             parser.feed(page)
             focused = parser.focus_parts or parser.parts
             excerpt = clean_encoding(" ".join(focused))
-            excerpt = re.sub(r"\\s+", " ", excerpt).strip()
+            excerpt = re.sub(r"\s+", " ", excerpt).strip()
             # The source can be live while containing no machine-verifiable fixture.
             return {"status": "ok", "text": excerpt[:12000],
                     "extraction_scope": "main_content" if parser.focus_parts else "page_fallback",
