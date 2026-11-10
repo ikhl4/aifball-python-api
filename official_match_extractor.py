@@ -19,7 +19,10 @@ OPPONENTS = (
     "Sevilla", "Racing de Santander", "Levante", "Feyenoord",
     "Valencia CF", "Rayo Vallecano", "Athletic Club", "Elche",
 )
-MOJIBAKE = {"Ã©": "é", "Ã¡": "á", "Ã³": "ó", "Ã­": "í", "Ã±": "ñ", "Ãº": "ú", "Ã¼": "ü"}
+# Construct corrupted byte sequences from code points, not source literals.
+# This remains reliable even if the editor or transport re-encodes the file.
+MOJIBAKE = {bytes([0xC3, second]).decode("latin-1"): chr(0x00C0 + (second - 0x80))
+            for second in range(0x80, 0xC0)}
 
 def clean_encoding(text):
     # Only repair known mojibake; do not re-encode arbitrary text.
