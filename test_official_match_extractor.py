@@ -36,3 +36,14 @@ def test_normalized_teams_and_mojibake():
 def test_unknown_opponent_not_guessed():
     text = "First Team Results November 2026 Sun 08 Nov La Liga Camp Nou FC Barcelona 2 - 1 Unrecognized Town"
     assert extract_barcelona_results(text, URL) == []
+
+
+def test_encoding_repair_for_raw_evidence_and_match_facts():
+    from official_match_extractor import clean_encoding
+    damaged = "Atl" + chr(0xC3) + chr(0xA9) + "tico Madrid, Alav" + chr(0xC3) + chr(0xA9) + "s"
+    assert clean_encoding(damaged) == "Atlético Madrid, Alavés"
+    text = ("First Team Results November 2026 Sun 08 Nov La Liga "
+            "Riyadh Air Metropolitano " + damaged.split(",")[0] + " 1 - 2 FC Barcelona Chevron")
+    matches = extract_barcelona_results(text, URL)
+    assert len(matches) == 1
+    assert matches[0]["home_team"] == "Atlético Madrid"
