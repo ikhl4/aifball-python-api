@@ -1,0 +1,23 @@
+name: Club research tests
+on:
+  pull_request:
+    paths:
+      - 'club_research.py'
+      - 'research_sources.py'
+      - 'test_club_research.py'
+      - 'main.py'
+      - 'requirements.txt'
+      - '.github/workflows/club-research-tests.yml'
+  push:
+    branches: [feat/verified-club-research]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install fastapi 'pydantic>=2' requests beautifulsoup4 pytest
+      - run: python -m compileall -q club_research.py research_sources.py test_club_research.py
+      - run: python -m pytest -q test_club_research.py
