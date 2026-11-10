@@ -22,3 +22,23 @@ def test_youth_scope_preserved():
     result = plan(RouteRequest(query="Al Ittihad", country="SA", squad="u21"))
     assert result["squad"] == "u21"
     assert all(x["status"] == "not_queried" for x in result["statistics_providers"])
+
+def test_new_world_regions():
+    for country, club, federation, confed in [
+        ("Brazil", "Flamengo", "CBF", "CONMEBOL"),
+        ("Argentina", "Boca Juniors", "AFA", "CONMEBOL"),
+        ("Japan", "Urawa Red Diamonds", "JFA", "AFC"),
+        ("South Africa", "Mamelodi Sundowns", "SAFA", "CAF"),
+    ]:
+        result = plan(RouteRequest(query=club, country=country, season="2026"))
+        names = {item["name"] for item in result["official_sources"]}
+        assert federation in names
+        assert confed in names
+        assert "SAFF" not in names
+        assert result["live_verified"] is False
+
+def test_regional_routing_for_existing_countries():
+    result = plan(RouteRequest(query="Barcelona", country="Spain"))
+    names = {item["name"] for item in result["official_sources"]}
+    assert "UEFA" in names
+    assert "AFC" not in names
