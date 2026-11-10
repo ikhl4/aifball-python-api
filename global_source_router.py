@@ -9,6 +9,14 @@ from pydantic import BaseModel, Field
 router = APIRouter(prefix="/research", tags=["global-source-routing"])
 
 REGISTRY = {
+    "BR": {"federation": [("CBF", "https://www.cbf.com.br/")],
+           "league": [("CBF competitions", "https://www.cbf.com.br/futebol-brasileiro/competicoes")]},
+    "AR": {"federation": [("AFA", "https://www.afa.com.ar/")],
+           "league": [("Liga Profesional", "https://www.ligaprofesional.ar/")]},
+    "JP": {"federation": [("JFA", "https://www.jfa.jp/eng/match/")],
+           "league": [("J.League", "https://www.jleague.jp/en/")]},
+    "ZA": {"federation": [("SAFA", "https://www.safa.net/")],
+           "league": [("Premier Soccer League", "https://www.psl.co.za/")]},
     "SA": {"federation": [("SAFF", "https://www.saff.com.sa/"), ("SAFF+", "https://saffplus.sa/ar")],
            "league": [("Saudi Pro League", "https://www.spl.com.sa/")]},
     "GB": {"federation": [("The FA", "https://www.thefa.com/")],
@@ -30,11 +38,28 @@ REGISTRY = {
     "EG": {"federation": [("EFA", "https://www.efa.eg/")],
            "league": [("Egyptian Pro League", "https://www.egyptianproleague.com/league")]},
 }
-GLOBAL = [("FIFA", "https://www.fifa.com/"), ("UEFA", "https://www.uefa.com/"),
-          ("AFC", "https://www.the-afc.com/")]
+GLOBAL = [("FIFA", "https://www.fifa.com/")]
+CONFEDERATIONS = {
+    "UEFA": ("UEFA", "https://www.uefa.com/"),
+    "AFC": ("AFC", "https://www.the-afc.com/"),
+    "CONMEBOL": ("CONMEBOL", "https://www.conmebol.com/"),
+    "CAF": ("CAF", "https://www.cafonline.com/"),
+    "CONCACAF": ("CONCACAF", "https://www.concacaf.com/"),
+}
+COUNTRY_CONFEDERATION = {
+    **dict.fromkeys(("SA", "AE", "QA", "JP"), "AFC"),
+    **dict.fromkeys(("GB", "ES", "IT", "DE", "FR"), "UEFA"),
+    **dict.fromkeys(("BR", "AR"), "CONMEBOL"),
+    **dict.fromkeys(("EG", "ZA"), "CAF"),
+    "US": "CONCACAF",
+}
 STATS = ["FotMob", "365Scores", "SofaScore"]
 # Do not treat country of an international competition as club nationality.
 ALIASES = {
+    "البرازيل": "BR", "brazil": "BR", "brasil": "BR",
+    "الأرجنتين": "AR", "argentina": "AR",
+    "اليابان": "JP", "japan": "JP",
+    "جنوب أفريقيا": "ZA", "جنوب افريقيا": "ZA", "south africa": "ZA",
     "السعودية": "SA", "saudi arabia": "SA", "ksa": "SA",
     "إنجلترا": "GB", "england": "GB", "uk": "GB",
     "إسبانيا": "ES", "spain": "ES",
@@ -63,8 +88,10 @@ def plan(request: RouteRequest):
         for kind, entries in REGISTRY[country].items():
             sources.extend({"name": name, "url": url, "kind": kind, "country": country}
                            for name, url in entries)
+    federation = COUNTRY_CONFEDERATION.get(country)
+    international = GLOBAL + ([CONFEDERATIONS[federation]] if federation else [])
     sources.extend({"name": name, "url": url, "kind": "international", "country": None}
-                   for name, url in GLOBAL)
+                   for name, url in international)
     return {
         "query": request.query, "country": country, "country_resolved": country is not None,
         "competition": request.competition, "season": request.season, "squad": request.squad,
