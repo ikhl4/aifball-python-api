@@ -47,3 +47,12 @@ def test_encoding_repair_for_raw_evidence_and_match_facts():
     matches = extract_barcelona_results(text, URL)
     assert len(matches) == 1
     assert matches[0]["home_team"] == "Atlético Madrid"
+
+
+def test_repair_double_encoded_official_text():
+    from official_match_extractor import clean_encoding
+    correct = "Atlético Madrid and Alavés"
+    twice = correct.encode("utf-8").decode("latin-1").encode("utf-8").decode("latin-1")
+    assert clean_encoding(twice) == correct
+    assert clean_encoding(correct) == correct
+    assert clean_encoding("الهلال") == "الهلال"
