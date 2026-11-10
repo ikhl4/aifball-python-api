@@ -10,6 +10,7 @@ import re
 import requests
 from fastapi import APIRouter, HTTPException, Query
 from global_source_router import REGISTRY, GLOBAL, CONFEDERATIONS
+from official_match_extractor import extract_barcelona_results
 
 router = APIRouter(prefix="/research/live", tags=["live-official-evidence"])
 
@@ -96,6 +97,10 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
                 "note": "No vetted club-specific first-team page configured."}
     title, url, squad = CLUB_PAGES[key]
     result = fetch_official(url)
+    if result.get("status") == "ok" and key in ("barcelona", "برشلونة"):
+        candidates = extract_barcelona_results(result.get("text", ""), url, squad)
+        result["match_facts"] = candidates
+        result["match_facts_status"] = "extracted_unverified" if candidates else "not_extracted"
     return {"club": club, "source_title": title, "source_url": url, "squad": squad,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "fetch": result, "verified_live": False,
