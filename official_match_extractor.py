@@ -25,9 +25,20 @@ MOJIBAKE = {bytes([0xC3, second]).decode("latin-1"): chr(0x00C0 + (second - 0x80
             for second in range(0x80, 0xC0)}
 
 def clean_encoding(text):
-    # Only repair known mojibake; do not re-encode arbitrary text.
-    for bad, good in MOJIBAKE.items():
-        text = text.replace(bad, good)
+    """Repair up to three layers of UTF-8 misdecoded as Latin-1/Windows-1252.
+
+    Repair only recognizable mojibake sequences; leave already-correct Unicode
+    (including Arabic and Spanish) untouched. Some official HTML is doubly encoded.
+    """
+    if not isinstance(text, str):
+        return text
+    for _ in range(3):
+        repaired = text
+        for bad, good in MOJIBAKE.items():
+            repaired = repaired.replace(bad, good)
+        if repaired == text:
+            break
+        text = repaired
     return text
 
 def _opponent(context, side):
