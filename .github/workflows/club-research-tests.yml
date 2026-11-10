@@ -3,6 +3,8 @@ on:
   pull_request:
     paths:
       - 'club_research.py'
+      - 'global_source_router.py'
+      - 'test_global_source_router.py'
       - 'research_sources.py'
       - 'test_club_research.py'
       - 'main.py'
@@ -19,5 +21,5 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install fastapi 'pydantic>=2' requests beautifulsoup4 pytest
-      - run: python -m compileall -q club_research.py research_sources.py test_club_research.py
-      - run: python -m pytest -q test_club_research.py
+      - run: python -m compileall -q club_research.py research_sources.py global_source_router.py test_club_research.py test_global_source_router.py
+      - run: python -m pytest -q test_club_research.py test_global_source_router.py
