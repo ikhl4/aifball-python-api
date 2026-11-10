@@ -10,7 +10,7 @@ import re
 import requests
 from fastapi import APIRouter, HTTPException, Query
 from global_source_router import REGISTRY, GLOBAL, CONFEDERATIONS
-from official_match_extractor import extract_barcelona_results
+from official_match_extractor import extract_barcelona_results, clean_encoding
 
 router = APIRouter(prefix="/research/live", tags=["live-official-evidence"])
 
@@ -77,10 +77,13 @@ def fetch_official(url: str):
             # requests apparent_encoding can misread Arabic; prefer declared charset or UTF-8.
             encoding = response.encoding if response.encoding and response.encoding.lower() not in ("iso-8859-1", "latin-1") else "utf-8"
             page = bytes(raw).decode(encoding, errors="replace")
+            # Official HTML may contain mojibake even when the declared charset decodes.
+            # Normalize known sequences before visible-text extraction and JSON output.
+            page = clean_encoding(page)
             parser = VisibleText()
             parser.feed(page)
             focused = parser.focus_parts or parser.parts
-            excerpt = " ".join(focused)
+            excerpt = clean_encoding(" ".join(focused))
             excerpt = re.sub(r"\\s+", " ", excerpt).strip()
             # The source can be live while containing no machine-verifiable fixture.
             return {"status": "ok", "text": excerpt[:12000],
