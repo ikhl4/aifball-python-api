@@ -6,8 +6,7 @@ user-supplied URLs. This endpoint is intentionally limited to official sources.
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.parse import urlparse
-import ipaddress
-import socket
+import re
 import requests
 from fastapi import APIRouter, HTTPException, Query
 from global_source_router import REGISTRY, GLOBAL, CONFEDERATIONS
@@ -33,15 +32,29 @@ class VisibleText(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.skip = 0
+        self.focus = 0
+        self.focus_parts = []
+        self._stack = []
     def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "noscript", "svg"):
+        attrs = dict(attrs)
+        self._stack.append((tag, bool(tag in ("main", "article") or attrs.get("role") == "main")))
+        if self._stack[-1][1]:
+            self.focus += 1
+        if tag in ("script", "style", "noscript", "svg", "nav", "footer", "header"):
             self.skip += 1
     def handle_endtag(self, tag):
-        if tag in ("script", "style", "noscript", "svg") and self.skip:
+        if tag in ("script", "style", "noscript", "svg", "nav", "footer", "header") and self.skip:
             self.skip -= 1
+        if self._stack and self._stack[-1][0] == tag:
+            _, focused = self._stack.pop()
+            if focused:
+                self.focus -= 1
     def handle_data(self, data):
         if not self.skip and data.strip():
-            self.parts.append(data.strip())
+            value = data.strip()
+            self.parts.append(value)
+            if self.focus:
+                self.focus_parts.append(value)
 
 def fetch_official(url: str):
     if url not in ALLOWED or urlparse(url).scheme != "https":
@@ -65,7 +78,13 @@ def fetch_official(url: str):
             page = bytes(raw).decode(encoding, errors="replace")
             parser = VisibleText()
             parser.feed(page)
-            return {"status": "ok", "text": " ".join(parser.parts)[:12000]}
+            focused = parser.focus_parts or parser.parts
+            excerpt = " ".join(focused)
+            excerpt = re.sub(r"\\s+", " ", excerpt).strip()
+            # The source can be live while containing no machine-verifiable fixture.
+            return {"status": "ok", "text": excerpt[:12000],
+                    "extraction_scope": "main_content" if parser.focus_parts else "page_fallback",
+                    "match_facts": [], "match_facts_status": "not_extracted"}
     except requests.RequestException as exc:
         return {"status": "fetch_failed", "error_type": type(exc).__name__}
 
