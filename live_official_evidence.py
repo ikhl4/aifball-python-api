@@ -119,29 +119,99 @@ def fetch_official(url: str):
     except requests.RequestException as exc:
         return {"status": "fetch_failed", "error_type": type(exc).__name__}
 
-# Independent-source evidence is deliberately explicit and auditable.
-# Do not infer verification from the club's own results page.
-INDEPENDENT_MATCH_EVIDENCE = {
-    ("2026-11-08", "La Liga", "Atlético Madrid", "FC Barcelona", 1, 2): {
-        "source": "LaLiga",
-        "url": "https://iaas-public-front-pro.laliga.com/en-US/match/temporada-2026-2027-laliga-ea-sports-atletico-de-madrid-fc-barcelona-12",
-    },
+# Independently fetch match scores from ESPN's public scoreboard feed.
+# A match is verified only when every identifying field agrees with the club page.
+ESPN_LEAGUES = {"La Liga": "esp.1", "UEFA Champions League": "uefa.champions"}
+ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
+TEAM_ALIASES = {
+    "fc barcelona": "barcelona", "barcelona": "barcelona",
+    "atlético madrid": "atletico madrid", "atlético de madrid": "atletico madrid",
+    "atletico madrid": "atletico madrid", "atletico de madrid": "atletico madrid",
+    "paris saint germain": "paris saint germain", "paris saint-germain": "paris saint germain",
+    "psg": "paris saint germain", "alavés": "alaves", "deportivo alaves": "alaves",
+    "real betis": "real betis", "real betis balompie": "real betis",
+    "valencia cf": "valencia", "valencia": "valencia",
+    "athletic club": "athletic club", "athletic bilbao": "athletic club",
+    "rayo vallecano": "rayo vallecano", "racing de santander": "racing santander",
+    "racing santander": "racing santander", "sevilla fc": "sevilla",
+    "sevilla": "sevilla", "galatasaray sk": "galatasaray",
+    "feyenoord rotterdam": "feyenoord", "getafe cf": "getafe",
+    "aston villa fc": "aston villa", "real madrid cf": "real madrid",
+    "levante ud": "levante", "elche cf": "elche",
 }
 
-def attach_independent_verification(matches):
+def normalized_team(name):
+    import unicodedata
+    name = clean_encoding(str(name or "")).casefold().strip()
+    name = re.sub(r"\\s+", " ", name)
+    name = TEAM_ALIASES.get(name, name)
+    return "".join(c for c in unicodedata.normalize("NFKD", name)
+                   if not unicodedata.combining(c))
+
+def independent_scoreboard(league, day):
+    """Bounded, fixed-host lookup; failures never produce a verified result."""
+    if league not in ESPN_LEAGUES or not re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", day):
+        return None
+    try:
+        response = requests.get(ESPN_URL.format(league=ESPN_LEAGUES[league]),
+                                params={"dates": day.replace("-", ""), "limit": 200},
+                                timeout=(3, 7), allow_redirects=False,
+                                headers={"User-Agent": "AiFBallResearch/1.0"})
+        if response.status_code != 200 or len(response.content) > 500_000:
+            return None
+        return response.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+def verify_matches_live(matches):
+    cache = {}
     verified = 0
     for match in matches:
         match["verification"] = "extracted_unverified"
         match.pop("verification_evidence", None)
-        key = (match.get("date"), match.get("competition"),
-               clean_encoding(match.get("home_team", "")),
-               clean_encoding(match.get("away_team", "")),
-               match.get("home_score"), match.get("away_score"))
-        evidence = INDEPENDENT_MATCH_EVIDENCE.get(key)
-        if evidence:
+        league, day = match.get("competition"), match.get("date")
+        if league not in ESPN_LEAGUES or not isinstance(day, str):
+            continue
+        cache_key = (league, day)
+        if cache_key not in cache:
+            cache[cache_key] = independent_scoreboard(league, day)
+        feed = cache[cache_key]
+        if not isinstance(feed, dict):
+            continue
+        for event in feed.get("events", []):
+            competition = (event.get("competitions") or [{}])[0]
+            competitors = competition.get("competitors") or []
+            if len(competitors) != 2 or not competition.get("status", {}).get("type", {}).get("completed", False):
+                continue
+            teams = {c.get("homeAway"): c for c in competitors}
+            home, away = teams.get("home"), teams.get("away")
+            if not home or not away:
+                continue
+            def names(c):
+                team = c.get("team") or {}
+                return {normalized_team(team.get(k)) for k in ("displayName", "name", "shortDisplayName")}
+            if normalized_team(match.get("home_team")) not in names(home):
+                continue
+            if normalized_team(match.get("away_team")) not in names(away):
+                continue
+            try:
+                if int(home.get("score")) != match.get("home_score") or int(away.get("score")) != match.get("away_score"):
+                    continue
+            except (ValueError, TypeError):
+                continue
+            # Compare local fixture date using the calendar date in the feed; avoid silently
+            # accepting a mismatched date. UTC timezone boundary may require later tuning.
+            if not str(event.get("date", "")).startswith(day):
+                continue
             match["verification"] = "verified_independent"
-            match["verification_evidence"] = evidence
+            match["verification_evidence"] = {
+                "source": "ESPN scoreboard",
+                "url": event.get("links", [{}])[0].get("href", ""),
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "event_id": str(event.get("id", "")),
+            }
             verified += 1
+            break
     return verified
 
 
@@ -156,7 +226,7 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
     if result.get("status") == "ok" and key in ("barcelona", "برشلونة"):
         candidates = extract_barcelona_results(result.get("text", ""), url, squad)
         result["match_facts"] = candidates
-        verified_count = attach_independent_verification(candidates)
+        verified_count = verify_matches_live(candidates)
         result["match_facts_status"] = "partially_verified" if verified_count else ("extracted_unverified" if candidates else "not_extracted")
         result["verification_summary"] = {"verified_independent": verified_count,
                                           "extracted_unverified": len(candidates) - verified_count,
