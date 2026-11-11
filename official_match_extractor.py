@@ -25,33 +25,25 @@ MOJIBAKE = {bytes([0xC3, second]).decode("latin-1"): chr(0x00C0 + (second - 0x80
             for second in range(0x80, 0xC0)}
 
 def clean_encoding(text):
-    """Reverse bounded Latin-1/Windows-1252 misdecoding of UTF-8 text.
+    """Repair common UTF-8 mojibake in mixed Unicode text, without touching Arabic.
 
-    A page may contain multiple layers of mojibake. Only accept a round-trip
-    when the text has the characteristic markers and the result improves them.
+    Match individual corrupted UTF-8 sequences rather than attempting to
+    re-encode an entire HTML page (which can contain mixed encodings).
     """
     if not isinstance(text, str):
         return text
+    # Build sequences from bytes so the source editor cannot corrupt literals.
+    # UTF-8 C3 A9 incorrectly read as Latin-1 yields U+00C3 U+00A9.
     for _ in range(3):
-        if not any(marker in text for marker in ("Ã", "Â", "â€")):
+        previous = text
+        for lead in (0xC2, 0xC3):
+            for tail in range(0x80, 0xC0):
+                raw = bytes((lead, tail))
+                bad = raw.decode("latin-1")
+                good = raw.decode("utf-8")
+                text = text.replace(bad, good)
+        if text == previous:
             break
-        candidate = None
-        for codec in ("latin-1", "cp1252"):
-            try:
-                decoded = text.encode(codec).decode("utf-8")
-            except (UnicodeError, LookupError):
-                continue
-            if decoded != text and sum(decoded.count(m) for m in ("Ã", "Â", "â€")) < sum(text.count(m) for m in ("Ã", "Â", "â€")):
-                candidate = decoded
-                break
-        if candidate is None:
-            # Recover individual common two-character sequences in mixed text.
-            candidate = text
-            for bad, good in MOJIBAKE.items():
-                candidate = candidate.replace(bad, good)
-            if candidate == text:
-                break
-        text = candidate
     return text
 
 def _opponent(context, side):
