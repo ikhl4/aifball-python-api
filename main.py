@@ -30,6 +30,9 @@ app = FastAPI(
 
 app.include_router(chat_jobs_router)
 
+from espn_club_engine import router as espn_club_engine_router
+app.include_router(espn_club_engine_router)
+
 @app.on_event("startup")
 def initialize_chat_jobs():
     start_worker()
