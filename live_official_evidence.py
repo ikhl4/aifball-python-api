@@ -143,14 +143,14 @@ TEAM_ALIASES = {
 def normalized_team(name):
     import unicodedata
     name = clean_encoding(str(name or "")).casefold().strip()
-    name = re.sub(r"\\s+", " ", name)
+    name = re.sub(r"\s+", " ", name)
     name = TEAM_ALIASES.get(name, name)
     return "".join(c for c in unicodedata.normalize("NFKD", name)
                    if not unicodedata.combining(c))
 
 def independent_scoreboard(league, day):
     """Fetch a fixed ESPN scoreboard endpoint, returning data and a safe diagnostic."""
-    if league not in ESPN_LEAGUES or not re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", str(day)):
+    if league not in ESPN_LEAGUES or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(day)):
         return None, "unsupported_league_or_date"
     try:
         response = requests.get(
