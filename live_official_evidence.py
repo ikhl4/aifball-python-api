@@ -489,32 +489,26 @@ def _fetch_competition_day(league, day):
         return league, "invalid_json", []
 
 # Independent FotMob fixture cross-check. Never infer verification from ESPN alone.
-FOTMOB_MATCHES_URL = "https://www.fotmob.com/api/matches"
+# Independent second-source candidate: SofaScore's public scheduled-events feed.
+# Availability is not guaranteed; all upstream failures fail closed.
+SOFASCORE_URL = "https://www.sofascore.com/api/v1/sport/football/scheduled-events/{date}"
 
-def _fotmob_day(day):
+def _sofascore_day(day):
     try:
         response = requests.get(
-            FOTMOB_MATCHES_URL, params={"date": day.strftime("%Y%m%d")},
+            SOFASCORE_URL.format(date=day.isoformat()),
             timeout=(3, 8), allow_redirects=False,
-            headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "application/json"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AiFBallResearch/1.0)",
+                     "Accept": "application/json"},
         )
         if response.status_code != 200:
             return "http_" + str(response.status_code), []
-        if len(response.content) > 2_000_000:
+        if len(response.content) > 3_000_000:
             return "response_too_large", []
         payload = response.json()
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
             return "invalid_payload", []
-        leagues = payload.get("leagues")
-        if not isinstance(leagues, list):
-            return "invalid_payload", []
-        events = []
-        for league in leagues:
-            if isinstance(league, dict):
-                for fixture in league.get("matches") or []:
-                    if isinstance(fixture, dict):
-                        events.append((league, fixture))
-        return "ok", events
+        return "ok", [e for e in payload["events"] if isinstance(e, dict)]
     except requests.Timeout:
         return "timeout", []
     except requests.RequestException:
@@ -523,45 +517,48 @@ def _fotmob_day(day):
         return "invalid_json", []
 
 
-def _fotmob_competition_matches(espn_code, league):
-    """Avoid validating a result against a match from an unrelated competition."""
-    name = normalized_team(league.get("name") or "")
-    country = normalized_team(league.get("ccode") or league.get("country") or "")
-    tokens = {
-        "ksa.1": ("saudi pro league", "pro league", "saudi arabia"),
-        "ksa.kings.cup": ("king's cup", "king cup", "kings cup", "custodian"),
+def _sofascore_competition_matches(espn_code, event):
+    tournament = event.get("tournament") or {}
+    unique = tournament.get("uniqueTournament") or {}
+    if not isinstance(tournament, dict) or not isinstance(unique, dict):
+        return False
+    name = normalized_team(unique.get("name") or tournament.get("name") or "")
+    aliases = {
+        "ksa.1": ("saudi pro league", "pro league"),
+        "ksa.kings.cup": ("king's cup", "kings cup", "king cup"),
         "afc.champions": ("afc champions league elite", "champions league elite"),
         "afc.cup": ("afc champions league two", "champions league two"),
         "eng.1": ("premier league",), "eng.fa": ("fa cup",),
         "eng.league_cup": ("efl cup", "league cup"),
         "esp.1": ("laliga", "la liga"), "esp.copa_del_rey": ("copa del rey",),
-        "esp.super_cup": ("supercopa", "super cup"),
+        "esp.super_cup": ("supercopa",),
         "ita.1": ("serie a",), "ita.coppa_italia": ("coppa italia",),
         "ger.1": ("bundesliga",), "ger.dfb_pokal": ("dfb pokal",),
         "fra.1": ("ligue 1",), "fra.coupe_de_france": ("coupe de france",),
-        "uefa.champions": ("champions league",),
+        "uefa.champions": ("uefa champions league", "champions league"),
         "uefa.europa": ("europa league",),
         "uefa.europa.conf": ("conference league",),
         "fifa.cwc": ("club world cup",),
     }
-    aliases = tokens.get(espn_code)
-    if not aliases:
+    expected = aliases.get(espn_code)
+    if not expected:
         return False
-    if espn_code == "uefa.champions" and ("afc" in name or "caf" in name):
+    if espn_code == "uefa.champions" and any(x in name for x in ("afc", "caf", "women", "youth")):
         return False
     if espn_code == "uefa.europa" and "conference" in name:
         return False
-    if espn_code == "uefa.champions" and ("women" in name or "youth" in name):
-        return False
-    if espn_code == "ksa.1" and "saudi" not in name and country not in ("sa", "ksa", "saudi arabia"):
-        return False
-    return any(token in name for token in aliases)
+    if espn_code == "ksa.1":
+        category = tournament.get("category") or unique.get("category") or {}
+        country = normalized_team(category.get("name") if isinstance(category, dict) else "")
+        if "saudi" not in name and country not in ("saudi arabia", "saudi"):
+            return False
+    return any(alias in name for alias in expected)
 
 
-def _fotmob_score(team):
+def _sofascore_score(team):
     try:
-        value = team.get("score")
-        return int(value) if value is not None and str(value).strip() != "" else None
+        value = team.get("current")
+        return int(value) if value is not None else None
     except (ValueError, TypeError):
         return None
 
@@ -584,7 +581,7 @@ def _crosscheck_latest(matches):
     evidence = []
     diagnostics = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(_fotmob_day, date) for date in sorted(dates)]
+        futures = [pool.submit(_sofascore_day, date) for date in sorted(dates)]
         for future in as_completed(futures):
             status, events = future.result()
             diagnostics[status] = diagnostics.get(status, 0) + 1
@@ -603,7 +600,7 @@ def _crosscheck_latest(matches):
         for league, event in evidence:
             if not _fotmob_competition_matches(match.get("competition_code"), league):
                 continue
-            h, a = event.get("home") or {}, event.get("away") or {}
+            h, a = event.get("homeTeam") or {}, event.get("awayTeam") or {}
             if not isinstance(h, dict) or not isinstance(a, dict):
                 continue
             if normalized_team(h.get("name")) != home or normalized_team(a.get("name")) != away:
@@ -621,15 +618,15 @@ def _crosscheck_latest(matches):
             except (ValueError, TypeError):
                 match["verification_reason"] = "independent_date_missing"
                 continue
-            if (_fotmob_score(h), _fotmob_score(a)) != espn_scores:
+            if (_sofascore_score(event.get("homeScore") or {}), _sofascore_score(event.get("awayScore") or {})) != espn_scores:
                 match["verification_reason"] = "independent_score_conflict"
                 continue
             match["verification"] = "verified_independent"
             match["verification_reason"] = "matched"
             match["verification_evidence"] = {
-                "source": "FotMob", "match_id": str(event.get("id") or ""),
+                "source": "SofaScore", "match_id": str(event.get("id") or ""),
                 "checked_at": datetime.now(timezone.utc).isoformat(),
-                "competition": league.get("name"), "date_utc": str(time),
+                "competition": (event.get("tournament") or {}).get("name"), "date_utc": independent_date.isoformat(),
             }
             verified += 1
             break
@@ -718,7 +715,7 @@ def club_latest_match(
         "verification_summary": verification_summary,
         "source": "ESPN scoreboard",
         "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
-        "note": "ESPN discovery with independent FotMob cross-check for up to five recent matches. Unmatched results are not independently verified.",
+        "note": "ESPN discovery with independent SofaScore cross-check for up to five recent matches. Unmatched results are not independently verified.",
     }
 
 
