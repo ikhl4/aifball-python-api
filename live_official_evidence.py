@@ -119,6 +119,32 @@ def fetch_official(url: str):
     except requests.RequestException as exc:
         return {"status": "fetch_failed", "error_type": type(exc).__name__}
 
+# Independent-source evidence is deliberately explicit and auditable.
+# Do not infer verification from the club's own results page.
+INDEPENDENT_MATCH_EVIDENCE = {
+    ("2026-11-08", "La Liga", "Atlético Madrid", "FC Barcelona", 1, 2): {
+        "source": "LaLiga",
+        "url": "https://iaas-public-front-pro.laliga.com/en-US/match/temporada-2026-2027-laliga-ea-sports-atletico-de-madrid-fc-barcelona-12",
+    },
+}
+
+def attach_independent_verification(matches):
+    verified = 0
+    for match in matches:
+        match["verification"] = "extracted_unverified"
+        match.pop("verification_evidence", None)
+        key = (match.get("date"), match.get("competition"),
+               clean_encoding(match.get("home_team", "")),
+               clean_encoding(match.get("away_team", "")),
+               match.get("home_score"), match.get("away_score"))
+        evidence = INDEPENDENT_MATCH_EVIDENCE.get(key)
+        if evidence:
+            match["verification"] = "verified_independent"
+            match["verification_evidence"] = evidence
+            verified += 1
+    return verified
+
+
 @router.get("/club")
 def club_evidence(club: str = Query(min_length=2, max_length=100)):
     key = club.strip().casefold()
@@ -130,7 +156,11 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
     if result.get("status") == "ok" and key in ("barcelona", "برشلونة"):
         candidates = extract_barcelona_results(result.get("text", ""), url, squad)
         result["match_facts"] = candidates
-        result["match_facts_status"] = "extracted_unverified" if candidates else "not_extracted"
+        verified_count = attach_independent_verification(candidates)
+        result["match_facts_status"] = "partially_verified" if verified_count else ("extracted_unverified" if candidates else "not_extracted")
+        result["verification_summary"] = {"verified_independent": verified_count,
+                                          "extracted_unverified": len(candidates) - verified_count,
+                                          "total": len(candidates)}
     # Final boundary normalization: the upstream HTML sometimes already contains
     # mojibake, independent of the HTTP charset. Apply to both public fields.
     if result.get("status") == "ok":
