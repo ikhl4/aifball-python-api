@@ -488,6 +488,154 @@ def _fetch_competition_day(league, day):
     except ValueError:
         return league, "invalid_json", []
 
+# Independent FotMob fixture cross-check. Never infer verification from ESPN alone.
+FOTMOB_MATCHES_URL = "https://www.fotmob.com/api/matches"
+
+def _fotmob_day(day):
+    try:
+        response = requests.get(
+            FOTMOB_MATCHES_URL, params={"date": day.strftime("%Y%m%d")},
+            timeout=(3, 8), allow_redirects=False,
+            headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "application/json"},
+        )
+        if response.status_code != 200:
+            return "http_" + str(response.status_code), []
+        if len(response.content) > 2_000_000:
+            return "response_too_large", []
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return "invalid_payload", []
+        leagues = payload.get("leagues")
+        if not isinstance(leagues, list):
+            return "invalid_payload", []
+        events = []
+        for league in leagues:
+            if isinstance(league, dict):
+                for fixture in league.get("matches") or []:
+                    if isinstance(fixture, dict):
+                        events.append((league, fixture))
+        return "ok", events
+    except requests.Timeout:
+        return "timeout", []
+    except requests.RequestException:
+        return "connection_failed", []
+    except ValueError:
+        return "invalid_json", []
+
+
+def _fotmob_competition_matches(espn_code, league):
+    """Avoid validating a result against a match from an unrelated competition."""
+    name = normalized_team(league.get("name") or "")
+    country = normalized_team(league.get("ccode") or league.get("country") or "")
+    tokens = {
+        "ksa.1": ("saudi pro league", "pro league", "saudi arabia"),
+        "ksa.kings.cup": ("king's cup", "king cup", "kings cup", "custodian"),
+        "afc.champions": ("afc champions league elite", "champions league elite"),
+        "afc.cup": ("afc champions league two", "champions league two"),
+        "eng.1": ("premier league",), "eng.fa": ("fa cup",),
+        "eng.league_cup": ("efl cup", "league cup"),
+        "esp.1": ("laliga", "la liga"), "esp.copa_del_rey": ("copa del rey",),
+        "esp.super_cup": ("supercopa", "super cup"),
+        "ita.1": ("serie a",), "ita.coppa_italia": ("coppa italia",),
+        "ger.1": ("bundesliga",), "ger.dfb_pokal": ("dfb pokal",),
+        "fra.1": ("ligue 1",), "fra.coupe_de_france": ("coupe de france",),
+        "uefa.champions": ("champions league",),
+        "uefa.europa": ("europa league",),
+        "uefa.europa.conf": ("conference league",),
+        "fifa.cwc": ("club world cup",),
+    }
+    aliases = tokens.get(espn_code)
+    if not aliases:
+        return False
+    if espn_code == "uefa.champions" and ("afc" in name or "caf" in name):
+        return False
+    if espn_code == "uefa.europa" and "conference" in name:
+        return False
+    if espn_code == "uefa.champions" and ("women" in name or "youth" in name):
+        return False
+    if espn_code == "ksa.1" and "saudi" not in name and country not in ("sa", "ksa", "saudi arabia"):
+        return False
+    return any(token in name for token in aliases)
+
+
+def _fotmob_score(team):
+    try:
+        value = team.get("score")
+        return int(value) if value is not None and str(value).strip() != "" else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _crosscheck_latest(matches):
+    """Only mark a fixture verified when an independent feed matches all facts."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import timedelta
+    if not matches:
+        return {"status": "no_matches", "checked": 0, "verified": 0}
+    # Limit independent requests to the latest fixtures, not every historical event.
+    recent = matches[:5]
+    dates = set()
+    for match in recent:
+        try:
+            date = datetime.fromisoformat(str(match.get("date_utc", "")).replace("Z", "+00:00")).date()
+            dates.update(date + timedelta(days=i) for i in (-1, 0, 1))
+        except ValueError:
+            match["verification_reason"] = "invalid_date"
+    evidence = []
+    diagnostics = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(_fotmob_day, date) for date in sorted(dates)]
+        for future in as_completed(futures):
+            status, events = future.result()
+            diagnostics[status] = diagnostics.get(status, 0) + 1
+            evidence.extend(events)
+    verified = 0
+    for match in recent:
+        match["verification_reason"] = "independent_source_unavailable" if not diagnostics.get("ok") else "independent_match_not_found"
+        home = normalized_team(match.get("home_team"))
+        away = normalized_team(match.get("away_team"))
+        try:
+            espn_date = datetime.fromisoformat(str(match.get("date_utc", "")).replace("Z", "+00:00")).date()
+            espn_scores = (int(match["home_score"]), int(match["away_score"]))
+        except (ValueError, TypeError, KeyError):
+            match["verification_reason"] = "invalid_espn_facts"
+            continue
+        for league, event in evidence:
+            if not _fotmob_competition_matches(match.get("competition_code"), league):
+                continue
+            h, a = event.get("home") or {}, event.get("away") or {}
+            if not isinstance(h, dict) or not isinstance(a, dict):
+                continue
+            if normalized_team(h.get("name")) != home or normalized_team(a.get("name")) != away:
+                continue
+            status = event.get("status") or {}
+            if not isinstance(status, dict) or not status.get("finished"):
+                match["verification_reason"] = "independent_fixture_not_final"
+                continue
+            # Date is independently checked using the fixture's UTC timestamp.
+            time = status.get("utcTime") or event.get("utcTime")
+            try:
+                independent_date = datetime.fromisoformat(str(time).replace("Z", "+00:00")).date()
+                if abs((independent_date - espn_date).days) > 1:
+                    continue
+            except (ValueError, TypeError):
+                match["verification_reason"] = "independent_date_missing"
+                continue
+            if (_fotmob_score(h), _fotmob_score(a)) != espn_scores:
+                match["verification_reason"] = "independent_score_conflict"
+                continue
+            match["verification"] = "verified_independent"
+            match["verification_reason"] = "matched"
+            match["verification_evidence"] = {
+                "source": "FotMob", "match_id": str(event.get("id") or ""),
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "competition": league.get("name"), "date_utc": str(time),
+            }
+            verified += 1
+            break
+    return {"status": "verified" if verified == len(recent) else "partially_verified" if verified else "unverified",
+            "checked": len(recent), "verified": verified, "diagnostics": diagnostics}
+
 @router.get("/major-competitions")
 def major_competitions():
     """Configured ESPN competition candidates, not a coverage guarantee."""
@@ -556,6 +704,7 @@ def club_latest_match(
                     "verification": "espn_only_unverified",
                 })
     matches.sort(key=lambda m: m.get("date_utc") or "", reverse=True)
+    verification_summary = _crosscheck_latest(matches)
     latest = matches[0] if matches else None
     full_coverage = all(diagnostics[league].get("ok", 0) == days + 1 for league in leagues)
     return {
@@ -565,10 +714,11 @@ def club_latest_match(
         "matches": matches[:20], "competitions_checked": list(leagues),
         "window_utc": {"start": start.isoformat(), "end": today.isoformat()},
         "request_diagnostics": diagnostics, "coverage_complete": full_coverage,
-        "verified_independent": False,
+        "verified_independent": bool(latest and latest.get("verification") == "verified_independent"),
+        "verification_summary": verification_summary,
         "source": "ESPN scoreboard",
         "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
-        "note": "Cross-competition ESPN-only search. Missing matches and unavailable feeds are not proof of no fixture. Independent verification not performed.",
+        "note": "ESPN discovery with independent FotMob cross-check for up to five recent matches. Unmatched results are not independently verified.",
     }
 
 
