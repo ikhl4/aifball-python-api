@@ -325,7 +325,7 @@ def espn_club_test(
     club: str = Query(min_length=2, max_length=100),
     days: int = Query(14, ge=1, le=31),
 ):
-    """Inspect recent ESPN coverage; never claim that ESPN-only results are verified."""
+    """Probe ESPN with single-day requests; results are not independently verified."""
     from datetime import timedelta
     config = ESPN_TEST_CLUBS.get(club.strip().casefold())
     if not config:
@@ -333,66 +333,84 @@ def espn_club_test(
     today = datetime.now(timezone.utc).date()
     start = today - timedelta(days=days)
     url = ESPN_URL.format(league=config["league"])
-    try:
-        response = requests.get(
-            url,
-            params={"dates": start.strftime("%Y%m%d") + "-" + today.strftime("%Y%m%d"), "limit": 250},
-            timeout=(3, 12), allow_redirects=False,
-            headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "application/json"},
-        )
-        if response.status_code != 200:
-            return {"club": club, "status": "espn_http_error", "http_status": response.status_code,
-                    "verified_independent": False, "matches": []}
-        if len(response.content) > 1_000_000:
-            return {"club": club, "status": "espn_response_too_large", "verified_independent": False, "matches": []}
-        feed = response.json()
-        if not isinstance(feed, dict):
-            raise ValueError("invalid ESPN payload")
-    except requests.Timeout:
-        return {"club": club, "status": "espn_timeout", "verified_independent": False, "matches": []}
-    except requests.RequestException:
-        return {"club": club, "status": "espn_connection_failed", "verified_independent": False, "matches": []}
-    except ValueError:
-        return {"club": club, "status": "espn_invalid_json", "verified_independent": False, "matches": []}
     target = {normalized_team(n) for n in config["names"]}
     matches = []
-    for event in feed.get("events") or []:
-        if not isinstance(event, dict):
+    seen = set()
+    statuses = {}
+    events_returned = 0
+    # Daily scoreboard requests are the known-working format from Barcelona.
+    # Keep this bounded for the free Render instance.
+    for offset in range(days + 1):
+        day = start + timedelta(days=offset)
+        try:
+            response = requests.get(
+                url,
+                params={"dates": day.strftime("%Y%m%d"), "limit": 200},
+                timeout=(3, 7), allow_redirects=False,
+                headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "application/json"},
+            )
+            if response.status_code != 200:
+                status = "http_" + str(response.status_code)
+                statuses[status] = statuses.get(status, 0) + 1
+                continue
+            if len(response.content) > 500_000:
+                statuses["response_too_large"] = statuses.get("response_too_large", 0) + 1
+                continue
+            feed = response.json()
+            if not isinstance(feed, dict):
+                statuses["invalid_payload"] = statuses.get("invalid_payload", 0) + 1
+                continue
+            statuses["ok"] = statuses.get("ok", 0) + 1
+        except requests.Timeout:
+            statuses["timeout"] = statuses.get("timeout", 0) + 1
             continue
-        competitions = event.get("competitions") or []
-        if not competitions or not isinstance(competitions[0], dict):
+        except requests.RequestException:
+            statuses["connection_failed"] = statuses.get("connection_failed", 0) + 1
             continue
-        competition = competitions[0]
-        competitors = competition.get("competitors") or []
-        teams = {c.get("homeAway"): c for c in competitors if isinstance(c, dict)}
-        home, away = teams.get("home"), teams.get("away")
-        if not home or not away:
+        except ValueError:
+            statuses["invalid_json"] = statuses.get("invalid_json", 0) + 1
             continue
-        def team_names(c):
-            team = c.get("team") or {}
-            return {normalized_team(team.get(k)) for k in ("displayName", "name", "shortDisplayName")}
-        if not (target & (team_names(home) | team_names(away))):
-            continue
-        status = competition.get("status") or event.get("status") or {}
-        matches.append({
-            "event_id": str(event.get("id", "")),
-            "date_utc": event.get("date"),
-            "home_team": (home.get("team") or {}).get("displayName"),
-            "away_team": (away.get("team") or {}).get("displayName"),
-            "home_score": home.get("score"),
-            "away_score": away.get("score"),
-            "completed": bool((status.get("type") or {}).get("completed", False)),
-            "source": "ESPN scoreboard",
-            "verification": "espn_only_unverified",
-        })
+        events = feed.get("events") or []
+        events_returned += len(events)
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            competitions = event.get("competitions") or []
+            if not competitions or not isinstance(competitions[0], dict):
+                continue
+            competition = competitions[0]
+            competitors = competition.get("competitors") or []
+            teams = {c.get("homeAway"): c for c in competitors if isinstance(c, dict)}
+            home, away = teams.get("home"), teams.get("away")
+            if not home or not away:
+                continue
+            def team_names(c):
+                team = c.get("team") or {}
+                return {normalized_team(team.get(k)) for k in ("displayName", "name", "shortDisplayName")}
+            if not (target & (team_names(home) | team_names(away))):
+                continue
+            event_id = str(event.get("id", ""))
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            status = competition.get("status") or event.get("status") or {}
+            matches.append({
+                "event_id": event_id, "date_utc": event.get("date"),
+                "home_team": (home.get("team") or {}).get("displayName"),
+                "away_team": (away.get("team") or {}).get("displayName"),
+                "home_score": home.get("score"), "away_score": away.get("score"),
+                "completed": bool((status.get("type") or {}).get("completed", False)),
+                "source": "ESPN scoreboard", "verification": "espn_only_unverified",
+            })
     return {
-        "club": club, "league": config["league"], "status": "ok",
+        "club": club, "league": config["league"],
+        "status": "ok" if statuses.get("ok") else "espn_unavailable",
         "source": "ESPN scoreboard", "source_url": url,
         "window_utc": {"start": start.isoformat(), "end": today.isoformat()},
-        "events_returned": len(feed.get("events") or []),
+        "request_diagnostics": statuses, "events_returned": events_returned,
         "matched_events": len(matches), "verified_independent": False,
         "matches": matches, "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
-        "note": "ESPN-only coverage test; independent verification is not performed.",
+        "note": "ESPN-only coverage probe; independent verification is not performed.",
     }
 
 
