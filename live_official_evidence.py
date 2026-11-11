@@ -272,7 +272,7 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
         candidates = extract_barcelona_results(result.get("text", ""), url, squad)
         result["match_facts"] = candidates
         verified_count, verification_diagnostics = verify_matches_live(candidates)
-        result["match_facts_status"] = "partially_verified" if verified_count else ("extracted_unverified" if candidates else "not_extracted")
+        result["match_facts_status"] = ("verified" if candidates and verified_count == len(candidates) else "partially_verified" if verified_count else "extracted_unverified" if candidates else "not_extracted")
         result["verification_diagnostics"] = verification_diagnostics
         result["verification_summary"] = {"verified_independent": verified_count,
                                           "extracted_unverified": len(candidates) - verified_count,
@@ -285,13 +285,14 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
             for field in ("home_team", "away_team", "competition"):
                 if isinstance(match.get(field), str):
                     match[field] = clean_encoding(match[field])
+    all_matches_verified = bool(result.get("match_facts")) and all(m.get("verification") == "verified_independent" for m in result["match_facts"])
     payload = normalize_output({"club": club, "source_title": title, "source_url": url, "squad": squad,
             "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
             "encoding_fix_revision": "unicode-diagnostic-v3",
             "encoding_diagnostic": {"sample_codepoints": [hex(ord(ch)) for ch in result.get("text", "")[max(0, result.get("text", "").find("Atl")):][:18]]},
             "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "fetch": result, "verified_live": False,
-            "note": "Raw page evidence only. Match facts require structured extraction and cross-checking."})
+            "fetch": result, "verified_live": all_matches_verified,
+            "note": ("All extracted match facts independently matched against ESPN." if all_matches_verified else "Match facts require independent cross-checking; inspect per-match verification.")})
     final_text = payload.get("fetch", {}).get("text", "")
     first_team = (payload.get("fetch", {}).get("match_facts") or [{}])[0].get("home_team", "")
     pos = final_text.find("Atl")
