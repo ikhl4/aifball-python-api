@@ -8,6 +8,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse
 import re
 import os
+import json
 import requests
 from fastapi import APIRouter, HTTPException, Query
 from global_source_router import REGISTRY, GLOBAL, CONFEDERATIONS
@@ -137,10 +138,21 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
             for field in ("home_team", "away_team", "competition"):
                 if isinstance(match.get(field), str):
                     match[field] = clean_encoding(match[field])
-    return normalize_output({"club": club, "source_title": title, "source_url": url, "squad": squad,
+    payload = normalize_output({"club": club, "source_title": title, "source_url": url, "squad": squad,
             "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
             "encoding_fix_revision": "unicode-diagnostic-v3",
             "encoding_diagnostic": {"sample_codepoints": [hex(ord(ch)) for ch in result.get("text", "")[max(0, result.get("text", "").find("Atl")):][:18]]},
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "fetch": result, "verified_live": False,
             "note": "Raw page evidence only. Match facts require structured extraction and cross-checking."})
+    final_text = payload.get("fetch", {}).get("text", "")
+    first_team = (payload.get("fetch", {}).get("match_facts") or [{}])[0].get("home_team", "")
+    pos = final_text.find("Atl")
+    payload["json_diagnostic"] = {
+        "final_text_sample": final_text[pos:pos + 20] if pos >= 0 else "",
+        "final_text_codepoints": [hex(ord(ch)) for ch in final_text[pos:pos + 12]] if pos >= 0 else [],
+        "first_team": first_team,
+        "first_team_codepoints": [hex(ord(ch)) for ch in first_team[:12]],
+        "json_roundtrip_equal": json.loads(json.dumps(payload, ensure_ascii=False)) == payload,
+    }
+    return payload
