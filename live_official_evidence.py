@@ -563,75 +563,125 @@ def _sofascore_score(team):
         return None
 
 
-def _crosscheck_latest(matches):
-    """Only mark a fixture verified when an independent feed matches all facts."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+# DuckDuckGo discovery is experimental. Only allowlisted original publishers
+# can serve as corroboration; a search snippet alone never verifies a score.
+DDG_HTML_URL = "https://html.duckduckgo.com/html/"
+EVIDENCE_HOSTS = (
+    "the-afc.com", "saff.com.sa", "spl.com.sa", "uefa.com",
+    "fifa.com", "premierleague.com", "laliga.com", "bundesliga.com",
+    "legaseriea.it", "ligue1.com", "fcbarcelona.com", "realmadrid.com",
+    "mancity.com", "psg.fr", "alhilal.com", "ittihadclub.sa",
+)
+
+def _evidence_host(host):
+    host = host.lower().removeprefix("www.")
+    return any(host == allowed or host.endswith("." + allowed) for allowed in EVIDENCE_HOSTS)
+
+class _DDGResults(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        a = dict(attrs)
+        if "result__a" in a.get("class", "").split():
+            self.links.append(a.get("href", ""))
+
+def _ddg_candidates(match):
+    from urllib.parse import parse_qs, unquote
+    date = str(match.get("date_utc", ""))[:10]
+    if not re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", date):
+        return "invalid_date", []
+    query = f'{match.get("home_team", "")} {match.get("away_team", "")} {date} {match.get("competition", "")} result'
+    try:
+        response = requests.get(DDG_HTML_URL, params={"q": query}, timeout=(3, 7),
+                                allow_redirects=False,
+                                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"})
+        if response.status_code != 200:
+            return "ddg_http_" + str(response.status_code), []
+        if len(response.content) > 400_000:
+            return "ddg_response_too_large", []
+        parser = _DDGResults()
+        parser.feed(response.text)
+        urls = []
+        for href in parser.links:
+            parsed = urlparse(href)
+            if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
+                href = parse_qs(parsed.query).get("uddg", [""])[0]
+                parsed = urlparse(unquote(href))
+            if parsed.scheme == "https" and parsed.hostname and _evidence_host(parsed.hostname):
+                urls.append(href)
+        return ("ok" if parser.links else "ddg_no_results"), list(dict.fromkeys(urls))[:3]
+    except requests.Timeout:
+        return "ddg_timeout", []
+    except requests.RequestException:
+        return "ddg_connection_failed", []
+    except Exception:
+        return "ddg_parse_failed", []
+
+def _official_page_check(url, match):
+    """Strictly require both teams, full match date and final score on one official page."""
     from datetime import timedelta
-    if not matches:
-        return {"status": "no_matches", "checked": 0, "verified": 0}
-    # Limit independent requests to the latest fixtures, not every historical event.
-    recent = matches[:5]
-    dates = set()
-    for match in recent:
-        try:
-            date = datetime.fromisoformat(str(match.get("date_utc", "")).replace("Z", "+00:00")).date()
-            dates.update(date + timedelta(days=i) for i in (-1, 0, 1))
-        except ValueError:
-            match["verification_reason"] = "invalid_date"
-    evidence = []
-    diagnostics = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(_sofascore_day, date) for date in sorted(dates)]
-        for future in as_completed(futures):
-            status, events = future.result()
-            diagnostics[status] = diagnostics.get(status, 0) + 1
-            evidence.extend(events)
-    verified = 0
-    for match in recent:
-        match["verification_reason"] = "independent_source_unavailable" if not diagnostics.get("ok") else "independent_match_not_found"
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname or not _evidence_host(parsed.hostname):
+        return "disallowed_host"
+    try:
+        response = requests.get(url, timeout=(3, 7), allow_redirects=False,
+                                headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "text/html"})
+        if response.status_code != 200:
+            return "official_http_" + str(response.status_code)
+        if "text/html" not in response.headers.get("Content-Type", "").lower() or len(response.content) > 500_000:
+            return "official_invalid_content"
+        parser = VisibleText()
+        parser.feed(response.text)
+        body = normalized_team(" ".join(parser.parts))
         home = normalized_team(match.get("home_team"))
         away = normalized_team(match.get("away_team"))
-        try:
-            espn_date = datetime.fromisoformat(str(match.get("date_utc", "")).replace("Z", "+00:00")).date()
-            espn_scores = (int(match["home_score"]), int(match["away_score"]))
-        except (ValueError, TypeError, KeyError):
-            match["verification_reason"] = "invalid_espn_facts"
+        if not home or not away or home not in body or away not in body:
+            return "teams_not_confirmed"
+        date = datetime.fromisoformat(str(match["date_utc"]).replace("Z", "+00:00")).date()
+        dates = [date + timedelta(days=i) for i in (-1, 0, 1)]
+        if not any(d.isoformat() in body or d.strftime("%d/%m/%Y") in body or
+                   d.strftime("%d %B %Y").casefold() in body for d in dates):
+            return "date_not_confirmed"
+        hs, aws = int(match["home_score"]), int(match["away_score"])
+        score_patterns = (rf"(?<!\\d){hs}\\s*[-–:]\\s*{aws}(?!\\d)",)
+        if not any(re.search(p, body) for p in score_patterns):
+            return "score_not_confirmed"
+        return "matched"
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return "official_fetch_failed"
+
+def _crosscheck_latest(matches):
+    """Bounded DDG discovery followed by official-site evidence; fail closed."""
+    recent = matches[:2]
+    diagnostics = {}
+    verified = 0
+    for match in recent:
+        match["verification"] = "espn_only_unverified"
+        match["verification_reason"] = "independent_source_unavailable"
+        status, urls = _ddg_candidates(match)
+        diagnostics[status] = diagnostics.get(status, 0) + 1
+        if not urls:
             continue
-        for league, event in evidence:
-            if not _fotmob_competition_matches(match.get("competition_code"), league):
-                continue
-            h, a = event.get("homeTeam") or {}, event.get("awayTeam") or {}
-            if not isinstance(h, dict) or not isinstance(a, dict):
-                continue
-            if normalized_team(h.get("name")) != home or normalized_team(a.get("name")) != away:
-                continue
-            status = event.get("status") or {}
-            if not isinstance(status, dict) or not status.get("finished"):
-                match["verification_reason"] = "independent_fixture_not_final"
-                continue
-            # Date is independently checked using the fixture's UTC timestamp.
-            time = status.get("utcTime") or event.get("utcTime")
-            try:
-                independent_date = datetime.fromisoformat(str(time).replace("Z", "+00:00")).date()
-                if abs((independent_date - espn_date).days) > 1:
-                    continue
-            except (ValueError, TypeError):
-                match["verification_reason"] = "independent_date_missing"
-                continue
-            if (_sofascore_score(event.get("homeScore") or {}), _sofascore_score(event.get("awayScore") or {})) != espn_scores:
-                match["verification_reason"] = "independent_score_conflict"
-                continue
-            match["verification"] = "verified_independent"
-            match["verification_reason"] = "matched"
-            match["verification_evidence"] = {
-                "source": "SofaScore", "match_id": str(event.get("id") or ""),
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "competition": (event.get("tournament") or {}).get("name"), "date_utc": independent_date.isoformat(),
-            }
-            verified += 1
-            break
-    return {"status": "verified" if verified == len(recent) else "partially_verified" if verified else "unverified",
-            "checked": len(recent), "verified": verified, "diagnostics": diagnostics}
+        match["verification_reason"] = "official_evidence_not_confirmed"
+        for url in urls:
+            outcome = _official_page_check(url, match)
+            diagnostics[outcome] = diagnostics.get(outcome, 0) + 1
+            if outcome == "matched":
+                match["verification"] = "verified_independent"
+                match["verification_reason"] = "matched"
+                match["verification_evidence"] = {
+                    "source": "Official publisher discovered via DuckDuckGo",
+                    "url": url, "checked_at": datetime.now(timezone.utc).isoformat(),
+                }
+                verified += 1
+                break
+    return {"status": "verified" if recent and verified == len(recent) else
+            "partially_verified" if verified else "unverified",
+            "checked": len(recent), "verified": verified, "diagnostics": diagnostics,
+            "method": "ddg_official_page_experimental"}
 
 @router.get("/major-competitions")
 def major_competitions():
@@ -715,7 +765,7 @@ def club_latest_match(
         "verification_summary": verification_summary,
         "source": "ESPN scoreboard",
         "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
-        "note": "ESPN discovery with independent SofaScore cross-check for up to five recent matches. Unmatched results are not independently verified.",
+        "note": "ESPN discovery with experimental DuckDuckGo official-page corroboration for up to two recent matches. Unmatched results are not independently verified.",
     }
 
 
