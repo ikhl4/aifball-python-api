@@ -195,3 +195,25 @@ def encoding_json_check():
     return JSONResponse(content=payload, headers={
         "X-AiFBall-Encoding-Test": "json-wire-v1",
     })
+
+
+@router.get("/encoding-wire-inspect")
+def encoding_wire_inspect():
+    """Inspect the serialized response bytes on the server, using ASCII-only output."""
+    sample = "Atl" + chr(0xE9) + "tico Madrid"
+    outgoing = JSONResponse(content={"name": sample})
+    body = outgoing.body
+    raw_utf8 = sample.encode("utf-8")
+    mojibake_utf8 = ("Atl" + chr(0xC3) + chr(0xA9) + "tico Madrid").encode("utf-8")
+    decoded = json.loads(body.decode("utf-8"))
+    return {
+        "revision": "wire-inspect-v1",
+        "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "response_content_type": outgoing.headers.get("content-type"),
+        "response_body_hex": body.hex(),
+        "correct_utf8_sequence_present": raw_utf8 in body,
+        "mojibake_utf8_sequence_present": mojibake_utf8 in body,
+        "decoded_name_codepoints": [hex(ord(ch)) for ch in decoded["name"]],
+        "decoded_name_matches_source": decoded["name"] == sample,
+        "expected_name_utf8_hex": raw_utf8.hex(),
+    }
