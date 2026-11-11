@@ -1,0 +1,844 @@
+"""Read-only live evidence fetcher for curated official football sources.
+
+Returns source text excerpts, NOT verified match facts. Never follows arbitrary
+user-supplied URLs. This endpoint is intentionally limited to official sources.
+"""
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from urllib.parse import urlparse
+import re
+import os
+import json
+import requests
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response, JSONResponse
+from global_source_router import REGISTRY, GLOBAL, CONFEDERATIONS
+from official_match_extractor import extract_barcelona_results, clean_encoding
+
+router = APIRouter(prefix="/research/live", tags=["live-official-evidence"])
+
+# ASCII-only explicit substitutions, independent of source-file encoding.
+# Limit to observed corrupted names; this is a guard, not a general codec fix.
+KNOWN_REPAIRS = {
+    "Atl\\u00c3\\u00a9tico": "Atl\\u00e9tico",
+    "Alav\\u00c3\\u00a9s": "Alav\\u00e9s",
+    "Ram\\u00c3\\u00b3n": "Ram\\u00f3n",
+    "S\\u00c3\\u00a1nchez": "S\\u00e1nchez",
+    "Pizju\\u00c3\\u00a1n": "Pizju\\u00e1n",
+    "Mart\\u00c3\\u00adnez": "Mart\\u00ednez",
+}
+
+def normalize_output(value):
+    if isinstance(value, str):
+        value = clean_encoding(value)
+        for bad, good in KNOWN_REPAIRS.items():
+            value = value.replace(bad, good)
+        return value
+    if isinstance(value, list):
+        return [normalize_output(item) for item in value]
+    if isinstance(value, dict):
+        return {key: normalize_output(item) for key, item in value.items()}
+    return value
+
+
+OFFICIAL_URLS = {
+    url for country in REGISTRY.values() for entries in country.values()
+    for _, url in entries
+} | {url for _, url in GLOBAL} | {url for _, url in CONFEDERATIONS.values()}
+# Explicit first-team pages, not inferred from home pages.
+CLUB_PAGES = {
+    "barcelona": ("FC Barcelona first-team results", "https://www.fcbarcelona.com/en/football/first-team/results", "first_team"),
+    "برشلونة": ("FC Barcelona first-team results", "https://www.fcbarcelona.com/en/football/first-team/results", "first_team"),
+    "al hilal": ("Al Hilal men's first-team fixtures", "https://alhilal.com/en/matches/mens-team/fixtures/saudi-arabian-league", "first_team"),
+    "الهلال": ("Al Hilal men's first-team fixtures", "https://alhilal.com/ar/matches/mens-team/fixtures", "first_team"),
+}
+ALLOWED = OFFICIAL_URLS | {v[1] for v in CLUB_PAGES.values()}
+MAX_BYTES = 500_000
+
+class VisibleText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.skip = 0
+        self.focus = 0
+        self.focus_parts = []
+        self._stack = []
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        self._stack.append((tag, bool(tag in ("main", "article") or attrs.get("role") == "main")))
+        if self._stack[-1][1]:
+            self.focus += 1
+        if tag in ("script", "style", "noscript", "svg", "nav", "footer", "header"):
+            self.skip += 1
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript", "svg", "nav", "footer", "header") and self.skip:
+            self.skip -= 1
+        if self._stack and self._stack[-1][0] == tag:
+            _, focused = self._stack.pop()
+            if focused:
+                self.focus -= 1
+    def handle_data(self, data):
+        if not self.skip and data.strip():
+            value = data.strip()
+            self.parts.append(value)
+            if self.focus:
+                self.focus_parts.append(value)
+
+def fetch_official(url: str):
+    if url not in ALLOWED or urlparse(url).scheme != "https":
+        raise HTTPException(400, "URL is not in the official source allowlist")
+    try:
+        # Disable redirects to avoid jumping to an unapproved host.
+        with requests.get(url, timeout=(4, 10), allow_redirects=False,
+                          headers={"User-Agent": "AiFBallResearch/1.0 (source verification)"}, stream=True) as response:
+            if 300 <= response.status_code < 400:
+                return {"status": "redirect_not_followed", "http_status": response.status_code}
+            response.raise_for_status()
+            if "text/html" not in response.headers.get("Content-Type", "").lower():
+                return {"status": "unsupported_content_type"}
+            raw = bytearray()
+            for chunk in response.iter_content(chunk_size=16384):
+                raw.extend(chunk)
+                if len(raw) > MAX_BYTES:
+                    return {"status": "page_too_large"}
+            # requests apparent_encoding can misread Arabic; prefer declared charset or UTF-8.
+            encoding = response.encoding if response.encoding and response.encoding.lower() not in ("iso-8859-1", "latin-1") else "utf-8"
+            page = bytes(raw).decode(encoding, errors="replace")
+            # Official HTML may contain mojibake even when the declared charset decodes.
+            # Normalize known sequences before visible-text extraction and JSON output.
+            page = clean_encoding(page)
+            parser = VisibleText()
+            parser.feed(page)
+            focused = parser.focus_parts or parser.parts
+            excerpt = clean_encoding(" ".join(focused))
+            excerpt = re.sub(r"\s+", " ", excerpt).strip()
+            # The source can be live while containing no machine-verifiable fixture.
+            return {"status": "ok", "text": excerpt[:12000],
+                    "extraction_scope": "main_content" if parser.focus_parts else "page_fallback",
+                    "match_facts": [], "match_facts_status": "not_extracted"}
+    except requests.RequestException as exc:
+        return {"status": "fetch_failed", "error_type": type(exc).__name__}
+
+# Independently fetch match scores from ESPN's public scoreboard feed.
+# A match is verified only when every identifying field agrees with the club page.
+ESPN_LEAGUES = {"La Liga": "esp.1", "UEFA Champions League": "uefa.champions"}
+ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
+TEAM_ALIASES = {
+    "fc barcelona": "barcelona", "barcelona": "barcelona",
+    "atlético madrid": "atletico madrid", "atlético de madrid": "atletico madrid",
+    "atletico madrid": "atletico madrid", "atletico de madrid": "atletico madrid",
+    "paris saint germain": "paris saint germain", "paris saint-germain": "paris saint germain",
+    "psg": "paris saint germain", "alavés": "alaves", "deportivo alaves": "alaves",
+    "real betis": "real betis", "real betis balompie": "real betis",
+    "valencia cf": "valencia", "valencia": "valencia",
+    "athletic club": "athletic club", "athletic bilbao": "athletic club",
+    "rayo vallecano": "rayo vallecano", "racing de santander": "racing santander",
+    "racing santander": "racing santander", "sevilla fc": "sevilla",
+    "sevilla": "sevilla", "galatasaray sk": "galatasaray",
+    "feyenoord rotterdam": "feyenoord", "getafe cf": "getafe",
+    "aston villa fc": "aston villa", "real madrid cf": "real madrid",
+    "levante ud": "levante", "elche cf": "elche",
+}
+
+def normalized_team(name):
+    import unicodedata
+    name = clean_encoding(str(name or "")).casefold().strip()
+    name = re.sub(r"\s+", " ", name)
+    name = TEAM_ALIASES.get(name, name)
+    return "".join(c for c in unicodedata.normalize("NFKD", name)
+                   if not unicodedata.combining(c))
+
+def independent_scoreboard(league, day):
+    """Fetch a fixed ESPN scoreboard endpoint, returning data and a safe diagnostic."""
+    if league not in ESPN_LEAGUES or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(day)):
+        return None, "unsupported_league_or_date"
+    try:
+        response = requests.get(
+            ESPN_URL.format(league=ESPN_LEAGUES[league]),
+            params={"dates": day.replace("-", ""), "limit": 200},
+            timeout=(3, 7), allow_redirects=False,
+            headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "application/json"},
+        )
+        if response.status_code != 200:
+            return None, "espn_http_" + str(response.status_code)
+        if len(response.content) > 500_000:
+            return None, "espn_response_too_large"
+        data = response.json()
+        if not isinstance(data, dict):
+            return None, "espn_invalid_payload"
+        return data, "ok"
+    except requests.Timeout:
+        return None, "espn_timeout"
+    except requests.RequestException:
+        return None, "espn_connection_failed"
+    except ValueError:
+        return None, "espn_invalid_json"
+
+
+def verify_matches_live(matches):
+    """Fail closed: only complete ESPN fixtures matching teams, scores and date verify."""
+    from datetime import timedelta
+    cache = {}
+    verified = 0
+    diagnostics = {}
+    for match in matches:
+        match["verification"] = "extracted_unverified"
+        match.pop("verification_evidence", None)
+        league, day = match.get("competition"), match.get("date")
+        if league not in ESPN_LEAGUES or not isinstance(day, str):
+            reason = "unsupported_competition"
+            match["verification_reason"] = reason
+            diagnostics[reason] = diagnostics.get(reason, 0) + 1
+            continue
+        # ESPN uses UTC calendar dates; a local match can appear on the previous/next day.
+        try:
+            fixture_date = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError:
+            match["verification_reason"] = "invalid_match_date"
+            diagnostics["invalid_match_date"] = diagnostics.get("invalid_match_date", 0) + 1
+            continue
+        feed_events = []
+        statuses = []
+        for offset in (-1, 0, 1):
+            lookup_day = (fixture_date + timedelta(days=offset)).isoformat()
+            cache_key = (league, lookup_day)
+            if cache_key not in cache:
+                cache[cache_key] = independent_scoreboard(league, lookup_day)
+            feed, status = cache[cache_key]
+            statuses.append(status)
+            if isinstance(feed, dict):
+                feed_events.extend(feed.get("events") or [])
+        reason = "espn_no_matching_fixture"
+        if all(status != "ok" for status in statuses):
+            reason = "espn_unavailable:" + ",".join(sorted(set(statuses)))
+        else:
+            for event in feed_events:
+                if not isinstance(event, dict):
+                    continue
+                competition = (event.get("competitions") or [{}])[0]
+                competitors = competition.get("competitors") or []
+                if len(competitors) != 2:
+                    continue
+                teams = {c.get("homeAway"): c for c in competitors if isinstance(c, dict)}
+                home, away = teams.get("home"), teams.get("away")
+                if not home or not away:
+                    continue
+                def names(c):
+                    team = c.get("team") or {}
+                    return {normalized_team(team.get(k)) for k in ("displayName", "name", "shortDisplayName", "abbreviation")}
+                if normalized_team(match.get("home_team")) not in names(home) or normalized_team(match.get("away_team")) not in names(away):
+                    continue
+                event_day = str(event.get("date", ""))[:10]
+                if not event_day or abs((datetime.strptime(event_day, "%Y-%m-%d").date() - fixture_date).days) > 1:
+                    continue
+                status = competition.get("status") or event.get("status") or {}
+                if not (status.get("type") or {}).get("completed", False):
+                    reason = "espn_fixture_not_final"
+                    continue
+                try:
+                    home_score, away_score = int(home.get("score")), int(away.get("score"))
+                except (TypeError, ValueError):
+                    reason = "espn_score_missing"
+                    continue
+                if home_score != match.get("home_score") or away_score != match.get("away_score"):
+                    reason = "espn_score_conflict"
+                    continue
+                links = event.get("links") or []
+                url = links[0].get("href", "") if links and isinstance(links[0], dict) else ""
+                match["verification"] = "verified_independent"
+                match["verification_evidence"] = {
+                    "source": "ESPN scoreboard", "url": url,
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "event_id": str(event.get("id", "")),
+                    "source_event_date_utc": event_day,
+                }
+                reason = "matched"
+                verified += 1
+                break
+        match["verification_reason"] = reason
+        diagnostics[reason] = diagnostics.get(reason, 0) + 1
+    return verified, diagnostics
+
+
+@router.get("/club")
+def club_evidence(club: str = Query(min_length=2, max_length=100)):
+    key = club.strip().casefold()
+    if key not in CLUB_PAGES:
+        return {"club": club, "status": "not_configured", "verified_live": False,
+                "note": "No vetted club-specific first-team page configured."}
+    title, url, squad = CLUB_PAGES[key]
+    result = fetch_official(url)
+    if result.get("status") == "ok" and key in ("barcelona", "برشلونة"):
+        candidates = extract_barcelona_results(result.get("text", ""), url, squad)
+        result["match_facts"] = candidates
+        verified_count, verification_diagnostics = verify_matches_live(candidates)
+        result["match_facts_status"] = ("verified" if candidates and verified_count == len(candidates) else "partially_verified" if verified_count else "extracted_unverified" if candidates else "not_extracted")
+        result["verification_diagnostics"] = verification_diagnostics
+        result["verification_summary"] = {"verified_independent": verified_count,
+                                          "extracted_unverified": len(candidates) - verified_count,
+                                          "total": len(candidates)}
+    # Final boundary normalization: the upstream HTML sometimes already contains
+    # mojibake, independent of the HTTP charset. Apply to both public fields.
+    if result.get("status") == "ok":
+        result["text"] = clean_encoding(result.get("text", ""))
+        for match in result.get("match_facts", []):
+            for field in ("home_team", "away_team", "competition"):
+                if isinstance(match.get(field), str):
+                    match[field] = clean_encoding(match[field])
+    all_matches_verified = bool(result.get("match_facts")) and all(m.get("verification") == "verified_independent" for m in result["match_facts"])
+    payload = normalize_output({"club": club, "source_title": title, "source_url": url, "squad": squad,
+            "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+            "encoding_fix_revision": "unicode-diagnostic-v3",
+            "encoding_diagnostic": {"sample_codepoints": [hex(ord(ch)) for ch in result.get("text", "")[max(0, result.get("text", "").find("Atl")):][:18]]},
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "fetch": result, "verified_live": all_matches_verified,
+            "note": ("All extracted match facts independently matched against ESPN." if all_matches_verified else "Match facts require independent cross-checking; inspect per-match verification.")})
+    final_text = payload.get("fetch", {}).get("text", "")
+    first_team = (payload.get("fetch", {}).get("match_facts") or [{}])[0].get("home_team", "")
+    pos = final_text.find("Atl")
+    payload["json_diagnostic"] = {
+        "final_text_sample": final_text[pos:pos + 20] if pos >= 0 else "",
+        "final_text_codepoints": [hex(ord(ch)) for ch in final_text[pos:pos + 12]] if pos >= 0 else [],
+        "first_team": first_team,
+        "first_team_codepoints": [hex(ord(ch)) for ch in first_team[:12]],
+        "json_roundtrip_equal": json.loads(json.dumps(payload, ensure_ascii=False)) == payload,
+    }
+    return Response(content=json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii"), media_type="application/json; charset=utf-8")
+
+
+# ESPN-only coverage probe. This is NOT independent verification.
+ESPN_TEST_CLUBS = {
+    "real madrid": {"league": "esp.1", "names": ("real madrid", "real madrid cf")},
+    "ريال مدريد": {"league": "esp.1", "names": ("real madrid", "real madrid cf")},
+    "al hilal": {"league": "ksa.1", "names": ("al hilal", "al-hilal", "al hilal saudi fc")},
+    "الهلال": {"league": "ksa.1", "names": ("al hilal", "al-hilal", "al hilal saudi fc")},
+    "al ittihad": {"league": "ksa.1", "names": ("al ittihad", "al-ittihad", "al ittihad club")},
+    "الاتحاد": {"league": "ksa.1", "names": ("al ittihad", "al-ittihad", "al ittihad club")},
+    "manchester city": {"league": "eng.1", "names": ("manchester city", "man city")},
+    "مانشستر سيتي": {"league": "eng.1", "names": ("manchester city", "man city")},
+    "paris saint germain": {"league": "fra.1", "names": ("paris saint germain", "paris saint-germain", "psg")},
+    "باريس سان جيرمان": {"league": "fra.1", "names": ("paris saint germain", "paris saint-germain", "psg")},
+}
+
+@router.get("/espn-club-test")
+def espn_club_test(
+    club: str = Query(min_length=2, max_length=100),
+    days: int = Query(14, ge=1, le=31),
+):
+    """Probe ESPN with single-day requests; results are not independently verified."""
+    from datetime import timedelta
+    config = ESPN_TEST_CLUBS.get(club.strip().casefold())
+    if not config:
+        raise HTTPException(400, "Club not configured for ESPN coverage probe")
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=days)
+    url = ESPN_URL.format(league=config["league"])
+    target = {normalized_team(n) for n in config["names"]}
+    matches = []
+    seen = set()
+    statuses = {}
+    events_returned = 0
+    # Daily scoreboard requests are the known-working format from Barcelona.
+    # Keep this bounded for the free Render instance.
+    for offset in range(days + 1):
+        day = start + timedelta(days=offset)
+        try:
+            response = requests.get(
+                url,
+                params={"dates": day.strftime("%Y%m%d"), "limit": 200},
+                timeout=(3, 7), allow_redirects=False,
+                headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "application/json"},
+            )
+            if response.status_code != 200:
+                status = "http_" + str(response.status_code)
+                statuses[status] = statuses.get(status, 0) + 1
+                continue
+            if len(response.content) > 500_000:
+                statuses["response_too_large"] = statuses.get("response_too_large", 0) + 1
+                continue
+            feed = response.json()
+            if not isinstance(feed, dict):
+                statuses["invalid_payload"] = statuses.get("invalid_payload", 0) + 1
+                continue
+            statuses["ok"] = statuses.get("ok", 0) + 1
+        except requests.Timeout:
+            statuses["timeout"] = statuses.get("timeout", 0) + 1
+            continue
+        except requests.RequestException:
+            statuses["connection_failed"] = statuses.get("connection_failed", 0) + 1
+            continue
+        except ValueError:
+            statuses["invalid_json"] = statuses.get("invalid_json", 0) + 1
+            continue
+        events = feed.get("events") or []
+        events_returned += len(events)
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            competitions = event.get("competitions") or []
+            if not competitions or not isinstance(competitions[0], dict):
+                continue
+            competition = competitions[0]
+            competitors = competition.get("competitors") or []
+            teams = {c.get("homeAway"): c for c in competitors if isinstance(c, dict)}
+            home, away = teams.get("home"), teams.get("away")
+            if not home or not away:
+                continue
+            def team_names(c):
+                team = c.get("team") or {}
+                return {normalized_team(team.get(k)) for k in ("displayName", "name", "shortDisplayName")}
+            if not (target & (team_names(home) | team_names(away))):
+                continue
+            event_id = str(event.get("id", ""))
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            status = competition.get("status") or event.get("status") or {}
+            matches.append({
+                "event_id": event_id, "date_utc": event.get("date"),
+                "home_team": (home.get("team") or {}).get("displayName"),
+                "away_team": (away.get("team") or {}).get("displayName"),
+                "home_score": home.get("score"), "away_score": away.get("score"),
+                "completed": bool((status.get("type") or {}).get("completed", False)),
+                "source": "ESPN scoreboard", "verification": "espn_only_unverified",
+            })
+    return {
+        "club": club, "league": config["league"],
+        "status": "ok" if statuses.get("ok") else "espn_unavailable",
+        "source": "ESPN scoreboard", "source_url": url,
+        "window_utc": {"start": start.isoformat(), "end": today.isoformat()},
+        "request_diagnostics": statuses, "events_returned": events_returned,
+        "matched_events": len(matches), "verified_independent": False,
+        "matches": matches, "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "note": "ESPN-only coverage probe; independent verification is not performed.",
+    }
+
+
+# ESPN competition identifiers are candidates, not guaranteed live coverage.
+# A failed feed must never be interpreted as evidence of no match.
+MAJOR_COMPETITIONS = {
+    "ksa.1": "Saudi Pro League", "ksa.kings.cup": "King's Cup",
+    "afc.champions": "AFC Champions League Elite", "afc.cup": "AFC Champions League Two",
+    "eng.1": "Premier League", "eng.fa": "FA Cup", "eng.league_cup": "EFL Cup",
+    "esp.1": "La Liga", "esp.copa_del_rey": "Copa del Rey", "esp.super_cup": "Spanish Super Cup",
+    "ita.1": "Serie A", "ita.coppa_italia": "Coppa Italia",
+    "ger.1": "Bundesliga", "ger.dfb_pokal": "DFB-Pokal",
+    "fra.1": "Ligue 1", "fra.coupe_de_france": "Coupe de France",
+    "uefa.champions": "UEFA Champions League", "uefa.europa": "UEFA Europa League",
+    "uefa.europa.conf": "UEFA Conference League", "uefa.super_cup": "UEFA Super Cup",
+    "fifa.cwc": "FIFA Club World Cup", "fifa.world": "FIFA World Cup",
+    "conmebol.libertadores": "Copa Libertadores",
+    "conmebol.sudamericana": "Copa Sudamericana",
+    "caf.champions": "CAF Champions League",
+    "concacaf.champions": "CONCACAF Champions Cup",
+    "usa.1": "MLS", "usa.open": "US Open Cup",
+    "club.friendly": "Club Friendlies",
+}
+# Scope requests to the competitions a club can actually play.
+CLUB_COMPETITIONS = {
+    "al hilal": ("ksa.1", "ksa.kings.cup", "afc.champions", "fifa.cwc"),
+    "al ittihad": ("ksa.1", "ksa.kings.cup", "afc.champions", "fifa.cwc"),
+    "al nassr": ("ksa.1", "ksa.kings.cup", "afc.champions", "afc.cup"),
+    "al ahli": ("ksa.1", "ksa.kings.cup", "afc.champions", "afc.cup"),
+    "real madrid": ("esp.1", "esp.copa_del_rey", "esp.super_cup", "uefa.champions", "fifa.cwc"),
+    "barcelona": ("esp.1", "esp.copa_del_rey", "esp.super_cup", "uefa.champions", "fifa.cwc"),
+    "manchester city": ("eng.1", "eng.fa", "eng.league_cup", "uefa.champions", "fifa.cwc"),
+    "paris saint germain": ("fra.1", "fra.coupe_de_france", "uefa.champions", "fifa.cwc"),
+}
+CLUB_NAME_KEYS = {
+    "الهلال": "al hilal", "al-hilal": "al hilal",
+    "الاتحاد": "al ittihad", "al-ittihad": "al ittihad",
+    "النصر": "al nassr", "al-nassr": "al nassr",
+    "الأهلي": "al ahli", "al-ahli": "al ahli",
+    "ريال مدريد": "real madrid", "برشلونة": "barcelona", "fc barcelona": "barcelona",
+    "مانشستر سيتي": "manchester city", "man city": "manchester city",
+    "باريس سان جيرمان": "paris saint germain", "psg": "paris saint germain",
+}
+CLUB_MATCH_ALIASES = {
+    "al hilal": ("al hilal", "al-hilal", "al hilal saudi fc"),
+    "al ittihad": ("al ittihad", "al-ittihad", "al ittihad club"),
+    "al nassr": ("al nassr", "al-nassr", "al nassr fc"),
+    "al ahli": ("al ahli", "al-ahli", "al ahli saudi"),
+    "real madrid": ("real madrid", "real madrid cf"),
+    "barcelona": ("barcelona", "fc barcelona"),
+    "manchester city": ("manchester city", "man city"),
+    "paris saint germain": ("paris saint germain", "paris saint-germain", "psg"),
+}
+
+def _fetch_competition_day(league, day):
+    try:
+        response = requests.get(
+            ESPN_URL.format(league=league),
+            params={"dates": day.strftime("%Y%m%d"), "limit": 200},
+            timeout=(3, 7), allow_redirects=False,
+            headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "application/json"},
+        )
+        if response.status_code != 200:
+            return league, "http_" + str(response.status_code), []
+        if len(response.content) > 500_000:
+            return league, "response_too_large", []
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("events", []), list):
+            return league, "invalid_payload", []
+        return league, "ok", payload.get("events", [])
+    except requests.Timeout:
+        return league, "timeout", []
+    except requests.RequestException:
+        return league, "connection_failed", []
+    except ValueError:
+        return league, "invalid_json", []
+
+# Independent FotMob fixture cross-check. Never infer verification from ESPN alone.
+# Independent second-source candidate: SofaScore's public scheduled-events feed.
+# Availability is not guaranteed; all upstream failures fail closed.
+SOFASCORE_URL = "https://www.sofascore.com/api/v1/sport/football/scheduled-events/{date}"
+
+def _sofascore_day(day):
+    try:
+        response = requests.get(
+            SOFASCORE_URL.format(date=day.isoformat()),
+            timeout=(3, 8), allow_redirects=False,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AiFBallResearch/1.0)",
+                     "Accept": "application/json"},
+        )
+        if response.status_code != 200:
+            return "http_" + str(response.status_code), []
+        if len(response.content) > 3_000_000:
+            return "response_too_large", []
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
+            return "invalid_payload", []
+        return "ok", [e for e in payload["events"] if isinstance(e, dict)]
+    except requests.Timeout:
+        return "timeout", []
+    except requests.RequestException:
+        return "connection_failed", []
+    except ValueError:
+        return "invalid_json", []
+
+
+def _sofascore_competition_matches(espn_code, event):
+    tournament = event.get("tournament") or {}
+    unique = tournament.get("uniqueTournament") or {}
+    if not isinstance(tournament, dict) or not isinstance(unique, dict):
+        return False
+    name = normalized_team(unique.get("name") or tournament.get("name") or "")
+    aliases = {
+        "ksa.1": ("saudi pro league", "pro league"),
+        "ksa.kings.cup": ("king's cup", "kings cup", "king cup"),
+        "afc.champions": ("afc champions league elite", "champions league elite"),
+        "afc.cup": ("afc champions league two", "champions league two"),
+        "eng.1": ("premier league",), "eng.fa": ("fa cup",),
+        "eng.league_cup": ("efl cup", "league cup"),
+        "esp.1": ("laliga", "la liga"), "esp.copa_del_rey": ("copa del rey",),
+        "esp.super_cup": ("supercopa",),
+        "ita.1": ("serie a",), "ita.coppa_italia": ("coppa italia",),
+        "ger.1": ("bundesliga",), "ger.dfb_pokal": ("dfb pokal",),
+        "fra.1": ("ligue 1",), "fra.coupe_de_france": ("coupe de france",),
+        "uefa.champions": ("uefa champions league", "champions league"),
+        "uefa.europa": ("europa league",),
+        "uefa.europa.conf": ("conference league",),
+        "fifa.cwc": ("club world cup",),
+    }
+    expected = aliases.get(espn_code)
+    if not expected:
+        return False
+    if espn_code == "uefa.champions" and any(x in name for x in ("afc", "caf", "women", "youth")):
+        return False
+    if espn_code == "uefa.europa" and "conference" in name:
+        return False
+    if espn_code == "ksa.1":
+        category = tournament.get("category") or unique.get("category") or {}
+        country = normalized_team(category.get("name") if isinstance(category, dict) else "")
+        if "saudi" not in name and country not in ("saudi arabia", "saudi"):
+            return False
+    return any(alias in name for alias in expected)
+
+
+def _sofascore_score(team):
+    try:
+        value = team.get("current")
+        return int(value) if value is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+# DuckDuckGo discovery is experimental. Only allowlisted original publishers
+# can serve as corroboration; a search snippet alone never verifies a score.
+DDG_HTML_URL = "https://html.duckduckgo.com/html/"
+EVIDENCE_HOSTS = (
+    "the-afc.com", "saff.com.sa", "spl.com.sa", "uefa.com",
+    "fifa.com", "premierleague.com", "laliga.com", "bundesliga.com",
+    "legaseriea.it", "ligue1.com", "fcbarcelona.com", "realmadrid.com",
+    "mancity.com", "psg.fr", "alhilal.com", "ittihadclub.sa",
+)
+
+def _evidence_host(host):
+    host = host.lower().removeprefix("www.")
+    return any(host == allowed or host.endswith("." + allowed) for allowed in EVIDENCE_HOSTS)
+
+class _DDGResults(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        a = dict(attrs)
+        if "result__a" in a.get("class", "").split():
+            self.links.append(a.get("href", ""))
+
+def _ddg_candidates(match):
+    from urllib.parse import parse_qs, unquote
+    date = str(match.get("date_utc", ""))[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return "invalid_date", []
+    query = f'{match.get("home_team", "")} {match.get("away_team", "")} {date} {match.get("competition", "")} result'
+    try:
+        response = requests.get(DDG_HTML_URL, params={"q": query}, timeout=(3, 7),
+                                allow_redirects=False,
+                                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"})
+        if response.status_code != 200:
+            return "ddg_http_" + str(response.status_code), []
+        if len(response.content) > 400_000:
+            return "ddg_response_too_large", []
+        parser = _DDGResults()
+        parser.feed(response.text)
+        urls = []
+        for href in parser.links:
+            parsed = urlparse(href)
+            if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
+                href = parse_qs(parsed.query).get("uddg", [""])[0]
+                parsed = urlparse(unquote(href))
+            if parsed.scheme == "https" and parsed.hostname and _evidence_host(parsed.hostname):
+                urls.append(href)
+        return ("ok" if parser.links else "ddg_no_results"), list(dict.fromkeys(urls))[:3]
+    except requests.Timeout:
+        return "ddg_timeout", []
+    except requests.RequestException:
+        return "ddg_connection_failed", []
+    except Exception:
+        return "ddg_parse_failed", []
+
+def _official_page_check(url, match):
+    """Strictly require both teams, full match date and final score on one official page."""
+    from datetime import timedelta
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname or not _evidence_host(parsed.hostname):
+        return "disallowed_host"
+    try:
+        response = requests.get(url, timeout=(3, 7), allow_redirects=False,
+                                headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "text/html"})
+        if response.status_code != 200:
+            return "official_http_" + str(response.status_code)
+        if "text/html" not in response.headers.get("Content-Type", "").lower() or len(response.content) > 500_000:
+            return "official_invalid_content"
+        parser = VisibleText()
+        parser.feed(response.text)
+        body = normalized_team(" ".join(parser.parts))
+        home = normalized_team(match.get("home_team"))
+        away = normalized_team(match.get("away_team"))
+        if not home or not away or home not in body or away not in body:
+            return "teams_not_confirmed"
+        date = datetime.fromisoformat(str(match["date_utc"]).replace("Z", "+00:00")).date()
+        dates = [date + timedelta(days=i) for i in (-1, 0, 1)]
+        if not any(d.isoformat() in body or d.strftime("%d/%m/%Y") in body or
+                   d.strftime("%d %B %Y").casefold() in body for d in dates):
+            return "date_not_confirmed"
+        hs, aws = int(match["home_score"]), int(match["away_score"])
+        score_patterns = (rf"(?<!\d){hs}\s*[-–:]\s*{aws}(?!\d)",)
+        if not any(re.search(p, body) for p in score_patterns):
+            return "score_not_confirmed"
+        return "matched"
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return "official_fetch_failed"
+
+def _crosscheck_latest(matches):
+    """Bounded DDG discovery followed by official-site evidence; fail closed."""
+    recent = matches[:2]
+    diagnostics = {}
+    verified = 0
+    for match in recent:
+        match["verification"] = "espn_only_unverified"
+        match["verification_reason"] = "independent_source_unavailable"
+        status, urls = _ddg_candidates(match)
+        diagnostics[status] = diagnostics.get(status, 0) + 1
+        if not urls:
+            continue
+        match["verification_reason"] = "official_evidence_not_confirmed"
+        for url in urls:
+            outcome = _official_page_check(url, match)
+            diagnostics[outcome] = diagnostics.get(outcome, 0) + 1
+            if outcome == "matched":
+                match["verification"] = "verified_independent"
+                match["verification_reason"] = "matched"
+                match["verification_evidence"] = {
+                    "source": "Official publisher discovered via DuckDuckGo",
+                    "url": url, "checked_at": datetime.now(timezone.utc).isoformat(),
+                }
+                verified += 1
+                break
+    return {"status": "verified" if recent and verified == len(recent) else
+            "partially_verified" if verified else "unverified",
+            "checked": len(recent), "verified": verified, "diagnostics": diagnostics,
+            "method": "ddg_official_page_experimental"}
+
+@router.get("/major-competitions")
+def major_competitions():
+    """Configured ESPN competition candidates, not a coverage guarantee."""
+    return {"competitions": MAJOR_COMPETITIONS, "club_scopes": CLUB_COMPETITIONS,
+            "note": "Configured ESPN codes; availability and independent verification vary."}
+
+@router.get("/club-latest-match")
+def club_latest_match(
+    club: str = Query(min_length=2, max_length=100),
+    days: int = Query(14, ge=1, le=31),
+):
+    """Latest completed match across configured competitions; ESPN-only evidence."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import timedelta
+    key = CLUB_NAME_KEYS.get(club.strip().casefold(), club.strip().casefold())
+    leagues = CLUB_COMPETITIONS.get(key)
+    if not leagues:
+        return {"club": club, "status": "not_configured", "verified_independent": False,
+                "note": "Club not configured for cross-competition lookup."}
+    target = {normalized_team(n) for n in CLUB_MATCH_ALIASES[key]}
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=days)
+    jobs = [(league, start + timedelta(days=i))
+            for league in leagues for i in range(days + 1)]
+    diagnostics = {league: {} for league in leagues}
+    matches, seen = [], set()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_fetch_competition_day, league, day) for league, day in jobs]
+        for future in as_completed(futures):
+            league, result, events = future.result()
+            diagnostics[league][result] = diagnostics[league].get(result, 0) + 1
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                competitions = event.get("competitions") or []
+                if not competitions or not isinstance(competitions[0], dict):
+                    continue
+                competition = competitions[0]
+                teams = {c.get("homeAway"): c for c in competition.get("competitors", [])
+                         if isinstance(c, dict)}
+                home, away = teams.get("home"), teams.get("away")
+                if not home or not away:
+                    continue
+                def names(entry):
+                    team = entry.get("team") or {}
+                    return {normalized_team(team.get(k)) for k in
+                            ("displayName", "name", "shortDisplayName")}
+                if not (target & (names(home) | names(away))):
+                    continue
+                status = competition.get("status") or event.get("status") or {}
+                if not (status.get("type") or {}).get("completed", False):
+                    continue
+                if home.get("score") is None or away.get("score") is None:
+                    continue
+                event_id = str(event.get("id") or "")
+                if not event_id or event_id in seen:
+                    continue
+                seen.add(event_id)
+                matches.append({
+                    "event_id": event_id, "date_utc": event.get("date"),
+                    "competition": MAJOR_COMPETITIONS[league], "competition_code": league,
+                    "home_team": (home.get("team") or {}).get("displayName"),
+                    "away_team": (away.get("team") or {}).get("displayName"),
+                    "home_score": home.get("score"), "away_score": away.get("score"),
+                    "completed": True, "source": "ESPN scoreboard",
+                    "verification": "espn_only_unverified",
+                })
+    matches.sort(key=lambda m: m.get("date_utc") or "", reverse=True)
+    verification_summary = _crosscheck_latest(matches)
+    latest = matches[0] if matches else None
+    full_coverage = all(diagnostics[league].get("ok", 0) == days + 1 for league in leagues)
+    return {
+        "club": club, "status": "found" if latest else
+            ("no_match_in_covered_window" if full_coverage else "incomplete_coverage"),
+        "latest_match": latest, "matches_found": len(matches),
+        "matches": matches[:20], "competitions_checked": list(leagues),
+        "window_utc": {"start": start.isoformat(), "end": today.isoformat()},
+        "request_diagnostics": diagnostics, "coverage_complete": full_coverage,
+        "verified_independent": bool(latest and latest.get("verification") == "verified_independent"),
+        "verification_summary": verification_summary,
+        "source": "ESPN scoreboard",
+        "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "note": "ESPN discovery with experimental DuckDuckGo official-page corroboration for up to two recent matches. Unmatched results are not independently verified.",
+    }
+
+
+@router.get("/encoding-check")
+def encoding_check():
+    """ASCII-only wire diagnostic; no upstream network fetch or personal data."""
+    sample = "Atl" + chr(0xE9) + "tico Madrid"
+    expected = sample.encode("utf-8")
+    payload = {
+        "revision": "http-encoding-check-v2",
+        "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "expected_name_ascii_escaped": sample.encode("unicode_escape").decode("ascii"),
+        "expected_utf8_hex": expected.hex(),
+        "expected_codepoints": [hex(ord(char)) for char in sample],
+        "expected_content_type": "application/json; charset=utf-8",
+        "explanation": "All fields are ASCII so browsers cannot corrupt the diagnostic itself.",
+    }
+    # Ensure the *actual outgoing body* is ASCII and can be inspected byte-for-byte.
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    return Response(content=body, media_type="application/json; charset=utf-8",
+                    headers={"X-AiFBall-Encoding-Test": "http-encoding-check-v2",
+                             "X-AiFBall-Expected-UTF8-Hex": expected.hex()})
+
+
+@router.get("/encoding-json-check")
+def encoding_json_check():
+    """Send real non-ASCII Unicode through FastAPI JSONResponse."""
+    sample = "Atl" + chr(0xE9) + "tico Madrid"
+    payload = {
+        "revision": "json-wire-v1",
+        "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "name": sample,
+        "name_codepoints": [hex(ord(ch)) for ch in sample],
+        "expected_utf8_hex": sample.encode("utf-8").hex(),
+        "is_real_unicode": chr(0xE9) in sample,
+    }
+    return Response(content=json.dumps(payload, ensure_ascii=True).encode("ascii"), media_type="application/json; charset=utf-8", headers={"X-AiFBall-Encoding-Test": "json-wire-v2-ascii-safe"})
+
+
+@router.get("/encoding-wire-inspect")
+def encoding_wire_inspect():
+    """Inspect the serialized response bytes on the server, using ASCII-only output."""
+    sample = "Atl" + chr(0xE9) + "tico Madrid"
+    outgoing = JSONResponse(content={"name": sample})
+    body = outgoing.body
+    raw_utf8 = sample.encode("utf-8")
+    mojibake_utf8 = ("Atl" + chr(0xC3) + chr(0xA9) + "tico Madrid").encode("utf-8")
+    decoded = json.loads(body.decode("utf-8"))
+    return {
+        "revision": "wire-inspect-v1",
+        "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "response_content_type": outgoing.headers.get("content-type"),
+        "response_body_hex": body.hex(),
+        "correct_utf8_sequence_present": raw_utf8 in body,
+        "mojibake_utf8_sequence_present": mojibake_utf8 in body,
+        "decoded_name_codepoints": [hex(ord(ch)) for ch in decoded["name"]],
+        "decoded_name_matches_source": decoded["name"] == sample,
+        "expected_name_utf8_hex": raw_utf8.hex(),
+    }
+
+
+@router.get("/encoding-html-check")
+def encoding_html_check():
+    """Visual mobile test with explicit charset."""
+    name = "Atl" + chr(0xE9) + "tico Madrid"
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>AiFBall encoding</title></head><body>"
+        "<h2>AiFBall encoding check</h2>"
+        "<p>Expected: Atl&amp;eacute;tico Madrid</p>"
+        "<p>Real Unicode: " + name + "</p>"
+        "<p>UTF-8: C3 A9; Unicode: U+00E9</p>"
+        "</body></html>"
+    )
+    return Response(content=html.encode("utf-8"), media_type="text/html; charset=utf-8")
