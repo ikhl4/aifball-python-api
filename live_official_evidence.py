@@ -15,6 +15,30 @@ from official_match_extractor import extract_barcelona_results, clean_encoding
 
 router = APIRouter(prefix="/research/live", tags=["live-official-evidence"])
 
+# ASCII-only explicit substitutions, independent of source-file encoding.
+# Limit to observed corrupted names; this is a guard, not a general codec fix.
+KNOWN_REPAIRS = {
+    "Atl\\u00c3\\u00a9tico": "Atl\\u00e9tico",
+    "Alav\\u00c3\\u00a9s": "Alav\\u00e9s",
+    "Ram\\u00c3\\u00b3n": "Ram\\u00f3n",
+    "S\\u00c3\\u00a1nchez": "S\\u00e1nchez",
+    "Pizju\\u00c3\\u00a1n": "Pizju\\u00e1n",
+    "Mart\\u00c3\\u00adnez": "Mart\\u00ednez",
+}
+
+def normalize_output(value):
+    if isinstance(value, str):
+        value = clean_encoding(value)
+        for bad, good in KNOWN_REPAIRS.items():
+            value = value.replace(bad, good)
+        return value
+    if isinstance(value, list):
+        return [normalize_output(item) for item in value]
+    if isinstance(value, dict):
+        return {key: normalize_output(item) for key, item in value.items()}
+    return value
+
+
 OFFICIAL_URLS = {
     url for country in REGISTRY.values() for entries in country.values()
     for _, url in entries
@@ -113,9 +137,10 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
             for field in ("home_team", "away_team", "competition"):
                 if isinstance(match.get(field), str):
                     match[field] = clean_encoding(match[field])
-    return {"club": club, "source_title": title, "source_url": url, "squad": squad,
+    return normalize_output({"club": club, "source_title": title, "source_url": url, "squad": squad,
             "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
-            "encoding_fix_revision": "boundary-v2",
+            "encoding_fix_revision": "unicode-diagnostic-v3",
+            "encoding_diagnostic": {"sample_codepoints": [hex(ord(ch)) for ch in result.get("text", "")[max(0, result.get("text", "").find("Atl")):][:18]]},
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "fetch": result, "verified_live": False,
-            "note": "Raw page evidence only. Match facts require structured extraction and cross-checking."}
+            "note": "Raw page evidence only. Match facts require structured extraction and cross-checking."})
