@@ -306,6 +306,96 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
     return Response(content=json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii"), media_type="application/json; charset=utf-8")
 
 
+# ESPN-only coverage probe. This is NOT independent verification.
+ESPN_TEST_CLUBS = {
+    "real madrid": {"league": "esp.1", "names": ("real madrid", "real madrid cf")},
+    "ريال مدريد": {"league": "esp.1", "names": ("real madrid", "real madrid cf")},
+    "al hilal": {"league": "sau.1", "names": ("al hilal", "al-hilal", "al hilal saudi fc")},
+    "الهلال": {"league": "sau.1", "names": ("al hilal", "al-hilal", "al hilal saudi fc")},
+    "al ittihad": {"league": "sau.1", "names": ("al ittihad", "al-ittihad", "al ittihad club")},
+    "الاتحاد": {"league": "sau.1", "names": ("al ittihad", "al-ittihad", "al ittihad club")},
+    "manchester city": {"league": "eng.1", "names": ("manchester city", "man city")},
+    "مانشستر سيتي": {"league": "eng.1", "names": ("manchester city", "man city")},
+    "paris saint germain": {"league": "fra.1", "names": ("paris saint germain", "paris saint-germain", "psg")},
+    "باريس سان جيرمان": {"league": "fra.1", "names": ("paris saint germain", "paris saint-germain", "psg")},
+}
+
+@router.get("/espn-club-test")
+def espn_club_test(
+    club: str = Query(min_length=2, max_length=100),
+    days: int = Query(14, ge=1, le=31),
+):
+    """Inspect recent ESPN coverage; never claim that ESPN-only results are verified."""
+    from datetime import timedelta
+    config = ESPN_TEST_CLUBS.get(club.strip().casefold())
+    if not config:
+        raise HTTPException(400, "Club not configured for ESPN coverage probe")
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=days)
+    url = ESPN_URL.format(league=config["league"])
+    try:
+        response = requests.get(
+            url,
+            params={"dates": start.strftime("%Y%m%d") + "-" + today.strftime("%Y%m%d"), "limit": 250},
+            timeout=(3, 12), allow_redirects=False,
+            headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "application/json"},
+        )
+        if response.status_code != 200:
+            return {"club": club, "status": "espn_http_error", "http_status": response.status_code,
+                    "verified_independent": False, "matches": []}
+        if len(response.content) > 1_000_000:
+            return {"club": club, "status": "espn_response_too_large", "verified_independent": False, "matches": []}
+        feed = response.json()
+        if not isinstance(feed, dict):
+            raise ValueError("invalid ESPN payload")
+    except requests.Timeout:
+        return {"club": club, "status": "espn_timeout", "verified_independent": False, "matches": []}
+    except requests.RequestException:
+        return {"club": club, "status": "espn_connection_failed", "verified_independent": False, "matches": []}
+    except ValueError:
+        return {"club": club, "status": "espn_invalid_json", "verified_independent": False, "matches": []}
+    target = {normalized_team(n) for n in config["names"]}
+    matches = []
+    for event in feed.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        competitions = event.get("competitions") or []
+        if not competitions or not isinstance(competitions[0], dict):
+            continue
+        competition = competitions[0]
+        competitors = competition.get("competitors") or []
+        teams = {c.get("homeAway"): c for c in competitors if isinstance(c, dict)}
+        home, away = teams.get("home"), teams.get("away")
+        if not home or not away:
+            continue
+        def team_names(c):
+            team = c.get("team") or {}
+            return {normalized_team(team.get(k)) for k in ("displayName", "name", "shortDisplayName")}
+        if not (target & (team_names(home) | team_names(away))):
+            continue
+        status = competition.get("status") or event.get("status") or {}
+        matches.append({
+            "event_id": str(event.get("id", "")),
+            "date_utc": event.get("date"),
+            "home_team": (home.get("team") or {}).get("displayName"),
+            "away_team": (away.get("team") or {}).get("displayName"),
+            "home_score": home.get("score"),
+            "away_score": away.get("score"),
+            "completed": bool((status.get("type") or {}).get("completed", False)),
+            "source": "ESPN scoreboard",
+            "verification": "espn_only_unverified",
+        })
+    return {
+        "club": club, "league": config["league"], "status": "ok",
+        "source": "ESPN scoreboard", "source_url": url,
+        "window_utc": {"start": start.isoformat(), "end": today.isoformat()},
+        "events_returned": len(feed.get("events") or []),
+        "matched_events": len(matches), "verified_independent": False,
+        "matches": matches, "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "note": "ESPN-only coverage test; independent verification is not performed.",
+    }
+
+
 @router.get("/encoding-check")
 def encoding_check():
     """ASCII-only wire diagnostic; no upstream network fetch or personal data."""
