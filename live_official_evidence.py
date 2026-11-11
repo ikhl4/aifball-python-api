@@ -156,7 +156,7 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
         "first_team_codepoints": [hex(ord(ch)) for ch in first_team[:12]],
         "json_roundtrip_equal": json.loads(json.dumps(payload, ensure_ascii=False)) == payload,
     }
-    return payload
+    return Response(content=json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii"), media_type="application/json; charset=utf-8")
 
 
 @router.get("/encoding-check")
@@ -192,9 +192,7 @@ def encoding_json_check():
         "expected_utf8_hex": sample.encode("utf-8").hex(),
         "is_real_unicode": chr(0xE9) in sample,
     }
-    return JSONResponse(content=payload, headers={
-        "X-AiFBall-Encoding-Test": "json-wire-v1",
-    })
+    return Response(content=json.dumps(payload, ensure_ascii=True).encode("ascii"), media_type="application/json; charset=utf-8", headers={"X-AiFBall-Encoding-Test": "json-wire-v2-ascii-safe"})
 
 
 @router.get("/encoding-wire-inspect")
@@ -217,3 +215,20 @@ def encoding_wire_inspect():
         "decoded_name_matches_source": decoded["name"] == sample,
         "expected_name_utf8_hex": raw_utf8.hex(),
     }
+
+
+@router.get("/encoding-html-check")
+def encoding_html_check():
+    """Visual mobile test with explicit charset."""
+    name = "Atl" + chr(0xE9) + "tico Madrid"
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>AiFBall encoding</title></head><body>"
+        "<h2>AiFBall encoding check</h2>"
+        "<p>Expected: Atl&amp;eacute;tico Madrid</p>"
+        "<p>Real Unicode: " + name + "</p>"
+        "<p>UTF-8: C3 A9; Unicode: U+00E9</p>"
+        "</body></html>"
+    )
+    return Response(content=html.encode("utf-8"), media_type="text/html; charset=utf-8")
