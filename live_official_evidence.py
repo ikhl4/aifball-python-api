@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 import re
+import os
 import requests
 from fastapi import APIRouter, HTTPException, Query
 from global_source_router import REGISTRY, GLOBAL, CONFEDERATIONS
@@ -113,6 +114,8 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
                 if isinstance(match.get(field), str):
                     match[field] = clean_encoding(match[field])
     return {"club": club, "source_title": title, "source_url": url, "squad": squad,
+            "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+            "encoding_fix_revision": "boundary-v2",
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "fetch": result, "verified_live": False,
             "note": "Raw page evidence only. Match facts require structured extraction and cross-checking."}
