@@ -591,7 +591,7 @@ class _DDGResults(HTMLParser):
 def _ddg_candidates(match):
     from urllib.parse import parse_qs, unquote
     date = str(match.get("date_utc", ""))[:10]
-    if not re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", date):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         return "invalid_date", []
     query = f'{match.get("home_team", "")} {match.get("away_team", "")} {date} {match.get("competition", "")} result'
     try:
@@ -646,7 +646,7 @@ def _official_page_check(url, match):
                    d.strftime("%d %B %Y").casefold() in body for d in dates):
             return "date_not_confirmed"
         hs, aws = int(match["home_score"]), int(match["away_score"])
-        score_patterns = (rf"(?<!\\d){hs}\\s*[-–:]\\s*{aws}(?!\\d)",)
+        score_patterns = (rf"(?<!\d){hs}\s*[-–:]\s*{aws}(?!\d)",)
         if not any(re.search(p, body) for p in score_patterns):
             return "score_not_confirmed"
         return "matched"
