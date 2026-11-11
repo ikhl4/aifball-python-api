@@ -11,7 +11,7 @@ import os
 import json
 import requests
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 from global_source_router import REGISTRY, GLOBAL, CONFEDERATIONS
 from official_match_extractor import extract_barcelona_results, clean_encoding
 
@@ -178,3 +178,20 @@ def encoding_check():
     return Response(content=body, media_type="application/json; charset=utf-8",
                     headers={"X-AiFBall-Encoding-Test": "http-encoding-check-v2",
                              "X-AiFBall-Expected-UTF8-Hex": expected.hex()})
+
+
+@router.get("/encoding-json-check")
+def encoding_json_check():
+    """Send real non-ASCII Unicode through FastAPI JSONResponse."""
+    sample = "Atl" + chr(0xE9) + "tico Madrid"
+    payload = {
+        "revision": "json-wire-v1",
+        "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "name": sample,
+        "name_codepoints": [hex(ord(ch)) for ch in sample],
+        "expected_utf8_hex": sample.encode("utf-8").hex(),
+        "is_real_unicode": chr(0xE9) in sample,
+    }
+    return JSONResponse(content=payload, headers={
+        "X-AiFBall-Encoding-Test": "json-wire-v1",
+    })
