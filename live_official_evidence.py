@@ -104,6 +104,14 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
         candidates = extract_barcelona_results(result.get("text", ""), url, squad)
         result["match_facts"] = candidates
         result["match_facts_status"] = "extracted_unverified" if candidates else "not_extracted"
+    # Final boundary normalization: the upstream HTML sometimes already contains
+    # mojibake, independent of the HTTP charset. Apply to both public fields.
+    if result.get("status") == "ok":
+        result["text"] = clean_encoding(result.get("text", ""))
+        for match in result.get("match_facts", []):
+            for field in ("home_team", "away_team", "competition"):
+                if isinstance(match.get(field), str):
+                    match[field] = clean_encoding(match[field])
     return {"club": club, "source_title": title, "source_url": url, "squad": squad,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "fetch": result, "verified_live": False,
