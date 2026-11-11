@@ -149,70 +149,115 @@ def normalized_team(name):
                    if not unicodedata.combining(c))
 
 def independent_scoreboard(league, day):
-    """Bounded, fixed-host lookup; failures never produce a verified result."""
-    if league not in ESPN_LEAGUES or not re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", day):
-        return None
+    """Fetch a fixed ESPN scoreboard endpoint, returning data and a safe diagnostic."""
+    if league not in ESPN_LEAGUES or not re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}", str(day)):
+        return None, "unsupported_league_or_date"
     try:
-        response = requests.get(ESPN_URL.format(league=ESPN_LEAGUES[league]),
-                                params={"dates": day.replace("-", ""), "limit": 200},
-                                timeout=(3, 7), allow_redirects=False,
-                                headers={"User-Agent": "AiFBallResearch/1.0"})
-        if response.status_code != 200 or len(response.content) > 500_000:
-            return None
-        return response.json()
-    except (requests.RequestException, ValueError):
-        return None
+        response = requests.get(
+            ESPN_URL.format(league=ESPN_LEAGUES[league]),
+            params={"dates": day.replace("-", ""), "limit": 200},
+            timeout=(3, 7), allow_redirects=False,
+            headers={"User-Agent": "AiFBallResearch/1.0", "Accept": "application/json"},
+        )
+        if response.status_code != 200:
+            return None, "espn_http_" + str(response.status_code)
+        if len(response.content) > 500_000:
+            return None, "espn_response_too_large"
+        data = response.json()
+        if not isinstance(data, dict):
+            return None, "espn_invalid_payload"
+        return data, "ok"
+    except requests.Timeout:
+        return None, "espn_timeout"
+    except requests.RequestException:
+        return None, "espn_connection_failed"
+    except ValueError:
+        return None, "espn_invalid_json"
+
 
 def verify_matches_live(matches):
+    """Fail closed: only complete ESPN fixtures matching teams, scores and date verify."""
+    from datetime import timedelta
     cache = {}
     verified = 0
+    diagnostics = {}
     for match in matches:
         match["verification"] = "extracted_unverified"
         match.pop("verification_evidence", None)
         league, day = match.get("competition"), match.get("date")
         if league not in ESPN_LEAGUES or not isinstance(day, str):
+            reason = "unsupported_competition"
+            match["verification_reason"] = reason
+            diagnostics[reason] = diagnostics.get(reason, 0) + 1
             continue
-        cache_key = (league, day)
-        if cache_key not in cache:
-            cache[cache_key] = independent_scoreboard(league, day)
-        feed = cache[cache_key]
-        if not isinstance(feed, dict):
+        # ESPN uses UTC calendar dates; a local match can appear on the previous/next day.
+        try:
+            fixture_date = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError:
+            match["verification_reason"] = "invalid_match_date"
+            diagnostics["invalid_match_date"] = diagnostics.get("invalid_match_date", 0) + 1
             continue
-        for event in feed.get("events", []):
-            competition = (event.get("competitions") or [{}])[0]
-            competitors = competition.get("competitors") or []
-            if len(competitors) != 2 or not competition.get("status", {}).get("type", {}).get("completed", False):
-                continue
-            teams = {c.get("homeAway"): c for c in competitors}
-            home, away = teams.get("home"), teams.get("away")
-            if not home or not away:
-                continue
-            def names(c):
-                team = c.get("team") or {}
-                return {normalized_team(team.get(k)) for k in ("displayName", "name", "shortDisplayName")}
-            if normalized_team(match.get("home_team")) not in names(home):
-                continue
-            if normalized_team(match.get("away_team")) not in names(away):
-                continue
-            try:
-                if int(home.get("score")) != match.get("home_score") or int(away.get("score")) != match.get("away_score"):
+        feed_events = []
+        statuses = []
+        for offset in (-1, 0, 1):
+            lookup_day = (fixture_date + timedelta(days=offset)).isoformat()
+            cache_key = (league, lookup_day)
+            if cache_key not in cache:
+                cache[cache_key] = independent_scoreboard(league, lookup_day)
+            feed, status = cache[cache_key]
+            statuses.append(status)
+            if isinstance(feed, dict):
+                feed_events.extend(feed.get("events") or [])
+        reason = "espn_no_matching_fixture"
+        if all(status != "ok" for status in statuses):
+            reason = "espn_unavailable:" + ",".join(sorted(set(statuses)))
+        else:
+            for event in feed_events:
+                if not isinstance(event, dict):
                     continue
-            except (ValueError, TypeError):
-                continue
-            # Compare local fixture date using the calendar date in the feed; avoid silently
-            # accepting a mismatched date. UTC timezone boundary may require later tuning.
-            if not str(event.get("date", "")).startswith(day):
-                continue
-            match["verification"] = "verified_independent"
-            match["verification_evidence"] = {
-                "source": "ESPN scoreboard",
-                "url": event.get("links", [{}])[0].get("href", ""),
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "event_id": str(event.get("id", "")),
-            }
-            verified += 1
-            break
-    return verified
+                competition = (event.get("competitions") or [{}])[0]
+                competitors = competition.get("competitors") or []
+                if len(competitors) != 2:
+                    continue
+                teams = {c.get("homeAway"): c for c in competitors if isinstance(c, dict)}
+                home, away = teams.get("home"), teams.get("away")
+                if not home or not away:
+                    continue
+                def names(c):
+                    team = c.get("team") or {}
+                    return {normalized_team(team.get(k)) for k in ("displayName", "name", "shortDisplayName", "abbreviation")}
+                if normalized_team(match.get("home_team")) not in names(home) or normalized_team(match.get("away_team")) not in names(away):
+                    continue
+                event_day = str(event.get("date", ""))[:10]
+                if not event_day or abs((datetime.strptime(event_day, "%Y-%m-%d").date() - fixture_date).days) > 1:
+                    continue
+                status = competition.get("status") or event.get("status") or {}
+                if not (status.get("type") or {}).get("completed", False):
+                    reason = "espn_fixture_not_final"
+                    continue
+                try:
+                    home_score, away_score = int(home.get("score")), int(away.get("score"))
+                except (TypeError, ValueError):
+                    reason = "espn_score_missing"
+                    continue
+                if home_score != match.get("home_score") or away_score != match.get("away_score"):
+                    reason = "espn_score_conflict"
+                    continue
+                links = event.get("links") or []
+                url = links[0].get("href", "") if links and isinstance(links[0], dict) else ""
+                match["verification"] = "verified_independent"
+                match["verification_evidence"] = {
+                    "source": "ESPN scoreboard", "url": url,
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "event_id": str(event.get("id", "")),
+                    "source_event_date_utc": event_day,
+                }
+                reason = "matched"
+                verified += 1
+                break
+        match["verification_reason"] = reason
+        diagnostics[reason] = diagnostics.get(reason, 0) + 1
+    return verified, diagnostics
 
 
 @router.get("/club")
@@ -226,8 +271,9 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
     if result.get("status") == "ok" and key in ("barcelona", "برشلونة"):
         candidates = extract_barcelona_results(result.get("text", ""), url, squad)
         result["match_facts"] = candidates
-        verified_count = verify_matches_live(candidates)
+        verified_count, verification_diagnostics = verify_matches_live(candidates)
         result["match_facts_status"] = "partially_verified" if verified_count else ("extracted_unverified" if candidates else "not_extracted")
+        result["verification_diagnostics"] = verification_diagnostics
         result["verification_summary"] = {"verified_independent": verified_count,
                                           "extracted_unverified": len(candidates) - verified_count,
                                           "total": len(candidates)}
