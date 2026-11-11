@@ -414,6 +414,43 @@ def espn_club_test(
     }
 
 
+@router.get("/club-latest-match")
+def club_latest_match(
+    club: str = Query(min_length=2, max_length=100),
+    days: int = Query(21, ge=1, le=31),
+):
+    """Latest completed domestic league match, ESPN-only and explicitly unverified.
+
+    Reuses the already tested single-day scoreboard retrieval and club aliases.
+    A missing match is not evidence that the club has not played in other competitions.
+    """
+    result = espn_club_test(club=club, days=days)
+    completed = [m for m in result.get("matches", []) if m.get("completed") is True
+                 and m.get("date_utc") and m.get("home_score") is not None
+                 and m.get("away_score") is not None]
+    completed.sort(key=lambda m: m["date_utc"], reverse=True)
+    latest = completed[0] if completed else None
+    status = ("found" if latest else
+              "no_completed_league_match_in_window" if result.get("status") == "ok"
+              and result.get("request_diagnostics", {}).get("ok") == days + 1
+              else "partial_source_failure" if result.get("request_diagnostics", {}).get("ok")
+              else "source_unavailable")
+    return {
+        "club": club,
+        "status": status,
+        "competition": result.get("league"),
+        "latest_match": latest,
+        "matches_found": len(completed),
+        "window_utc": result.get("window_utc"),
+        "request_diagnostics": result.get("request_diagnostics"),
+        "source": "ESPN scoreboard",
+        "verified_independent": False,
+        "coverage": "domestic_league_only",
+        "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "note": "Domestic league ESPN results only; cup and continental matches not yet included. Independent verification is not performed.",
+    }
+
+
 @router.get("/encoding-check")
 def encoding_check():
     """ASCII-only wire diagnostic; no upstream network fetch or personal data."""
