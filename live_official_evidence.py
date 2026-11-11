@@ -11,6 +11,7 @@ import os
 import json
 import requests
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
 from global_source_router import REGISTRY, GLOBAL, CONFEDERATIONS
 from official_match_extractor import extract_barcelona_results, clean_encoding
 
@@ -156,3 +157,24 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
         "json_roundtrip_equal": json.loads(json.dumps(payload, ensure_ascii=False)) == payload,
     }
     return payload
+
+
+@router.get("/encoding-check")
+def encoding_check():
+    """ASCII-only wire diagnostic; no upstream network fetch or personal data."""
+    sample = "Atl\\u00e9tico Madrid"
+    expected = sample.encode("utf-8")
+    payload = {
+        "revision": "http-encoding-check-v1",
+        "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+        "expected_name_ascii_escaped": sample.encode("unicode_escape").decode("ascii"),
+        "expected_utf8_hex": expected.hex(),
+        "expected_codepoints": [hex(ord(char)) for char in sample],
+        "expected_content_type": "application/json; charset=utf-8",
+        "explanation": "All fields are ASCII so browsers cannot corrupt the diagnostic itself.",
+    }
+    # Ensure the *actual outgoing body* is ASCII and can be inspected byte-for-byte.
+    body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    return Response(content=body, media_type="application/json; charset=utf-8",
+                    headers={"X-AiFBall-Encoding-Test": "http-encoding-check-v1",
+                             "X-AiFBall-Expected-UTF8-Hex": expected.hex()})
