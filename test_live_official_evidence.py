@@ -1,3 +1,5 @@
+import json
+from fastapi.responses import Response
 from fastapi import HTTPException
 from live_official_evidence import fetch_official, club_evidence, VisibleText
 
@@ -19,9 +21,12 @@ def test_html_visible_text_only():
     assert "برشلونة" in p.parts
     assert "secret" not in p.parts
 
+def decode_response(value):
+    return json.loads(value.body) if isinstance(value, Response) else value
+
 def test_official_club_identity(monkeypatch):
     monkeypatch.setattr("live_official_evidence.fetch_official", lambda url: {"status": "ok", "text": "Sample"})
-    result = club_evidence("Barcelona")
+    result = decode_response(club_evidence("Barcelona"))
     assert result["squad"] == "first_team"
     assert result["verified_live"] is False
     assert result["fetch"]["status"] == "ok"
@@ -37,6 +42,6 @@ def test_unknown_match_facts_not_claimed(monkeypatch):
     monkeypatch.setattr("live_official_evidence.fetch_official", lambda url: {
         "status": "ok", "text": "Results", "match_facts": [],
         "match_facts_status": "not_extracted"})
-    result = club_evidence("Barcelona")
+    result = decode_response(club_evidence("Barcelona"))
     assert result["verified_live"] is False
     assert result["fetch"]["match_facts"] == []
