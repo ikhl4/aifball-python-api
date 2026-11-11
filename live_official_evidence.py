@@ -162,10 +162,10 @@ def club_evidence(club: str = Query(min_length=2, max_length=100)):
 @router.get("/encoding-check")
 def encoding_check():
     """ASCII-only wire diagnostic; no upstream network fetch or personal data."""
-    sample = "Atl\\u00e9tico Madrid"
+    sample = "Atl" + chr(0xE9) + "tico Madrid"
     expected = sample.encode("utf-8")
     payload = {
-        "revision": "http-encoding-check-v1",
+        "revision": "http-encoding-check-v2",
         "runtime_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
         "expected_name_ascii_escaped": sample.encode("unicode_escape").decode("ascii"),
         "expected_utf8_hex": expected.hex(),
@@ -176,5 +176,5 @@ def encoding_check():
     # Ensure the *actual outgoing body* is ASCII and can be inspected byte-for-byte.
     body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
     return Response(content=body, media_type="application/json; charset=utf-8",
-                    headers={"X-AiFBall-Encoding-Test": "http-encoding-check-v1",
+                    headers={"X-AiFBall-Encoding-Test": "http-encoding-check-v2",
                              "X-AiFBall-Expected-UTF8-Hex": expected.hex()})
